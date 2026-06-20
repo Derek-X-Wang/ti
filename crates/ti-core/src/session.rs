@@ -4,7 +4,7 @@
 //! The unit of lifecycle (create / close) and the unit a Driving Agent or
 //! Inspector connects to. See CONTEXT.md for full glossary definitions.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
@@ -23,9 +23,19 @@ const DEFAULT_ROWS: u16 = 24;
 /// terminal that processes the output into a queryable screen buffer. Multiple
 /// callers may take Snapshots concurrently; the screen buffer is protected by
 /// an `Arc<Mutex<Vt>>`.
+///
+/// Input (keystrokes / raw bytes) is sent through the PTY master writer. The
+/// Write Lock lives *above* this layer in [`SessionRegistry`] — `send_input`
+/// performs no access-control check; callers are responsible for enforcing that
+/// only the Writer may call it.
 pub struct Session {
     /// avt virtual terminal — the screen buffer.
     vt: Arc<Mutex<Vt>>,
+    /// PTY master writer — sends bytes into the Hosted Process's stdin.
+    ///
+    /// `portable_pty` allows only one writer to be taken per PTY master, so we
+    /// hold it for the lifetime of the Session.
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// Handle to the Hosted Process (so callers can wait for it).
     child: Box<dyn portable_pty::Child + Send + Sync>,
     /// Background reader thread. Wrapped in `Option` so `wait()` can join it,
@@ -82,6 +92,14 @@ impl Session {
             .try_clone_reader()
             .context("failed to clone PTY master reader")?;
 
+        // Take the writer before the reader loop starts. `take_writer` can only
+        // be called once per PTY master, so we hold it for the Session lifetime.
+        let pty_writer = pair
+            .master
+            .take_writer()
+            .context("failed to take PTY master writer")?;
+        let writer = Arc::new(Mutex::new(pty_writer));
+
         let vt = Arc::new(Mutex::new(Vt::new(cols as usize, rows as usize)));
         let vt_clone = Arc::clone(&vt);
 
@@ -103,6 +121,7 @@ impl Session {
 
         Ok(Self {
             vt,
+            writer,
             child,
             reader_thread: Some(reader_thread),
         })
@@ -128,6 +147,21 @@ impl Session {
             cursor_row: cursor.row,
             cursor_visible: cursor.visible,
         })
+    }
+
+    /// Send raw bytes into the Hosted Process's stdin via the PTY master writer.
+    ///
+    /// **Low-level primitive — do not call directly.** Access control (Write Lock
+    /// enforcement) is the caller's responsibility. The canonical call site is
+    /// [`SessionRegistry::write_input`] in `ti-daemon`, which checks the caller's
+    /// Writer identity before dispatching here.
+    pub fn send_input(&self, data: &[u8]) -> anyhow::Result<()> {
+        let mut w = self
+            .writer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("PTY writer lock poisoned"))?;
+        w.write_all(data).context("failed to write to PTY master")?;
+        w.flush().context("failed to flush PTY master writer")
     }
 
     /// Wait for the Hosted Process to exit and for all PTY output to be emulated.

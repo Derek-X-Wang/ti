@@ -3,7 +3,7 @@
 //! These tests spin up the full axum+rmcp server stack in-process and drive it
 //! with raw MCP JSON-RPC calls via reqwest, verifying the complete path from
 //! HTTP request → Bearer Token auth → MCP dispatch → Session registry →
-//! text Snapshot (acceptance criterion for issue #2).
+//! text Snapshot (acceptance criteria for issues #2 and #3).
 
 use std::sync::Arc;
 
@@ -142,7 +142,7 @@ fn registry_create_and_snapshot() {
     let registry = SessionRegistry::new();
 
     let id = registry
-        .create_session("s1".to_string(), "echo", &["hello"])
+        .create_session("s1".to_string(), "echo", &["hello"], "writer-a".to_string())
         .expect("create_session failed");
     assert_eq!(id, "s1");
 
@@ -162,10 +162,10 @@ fn registry_create_and_snapshot() {
 fn registry_rejects_duplicate_id() {
     let registry = SessionRegistry::new();
     registry
-        .create_session("dup".to_string(), "echo", &["a"])
+        .create_session("dup".to_string(), "echo", &["a"], "writer-a".to_string())
         .unwrap();
     let err = registry
-        .create_session("dup".to_string(), "echo", &["b"])
+        .create_session("dup".to_string(), "echo", &["b"], "writer-b".to_string())
         .unwrap_err();
     assert!(err.to_string().contains("already exists"));
 }
@@ -176,6 +176,82 @@ fn registry_unknown_id_errors() {
     let registry = SessionRegistry::new();
     let err = registry.take_snapshot("nonexistent").unwrap_err();
     assert!(err.to_string().contains("no Session with id"));
+}
+
+// ── Unit tests for Write Lock ────────────────────────────────────────────────
+
+/// The Writer (creating client) can send input to its own Session.
+#[test]
+fn write_lock_writer_can_send_input() {
+    let registry = SessionRegistry::new();
+    // Spawn a long-running process (cat reads from stdin indefinitely).
+    registry
+        .create_session("ws1".to_string(), "cat", &[], "writer-a".to_string())
+        .expect("create_session failed");
+
+    // The Writer can send input.
+    let result = registry.write_input("ws1", "writer-a", b"hello\n");
+    assert!(result.is_ok(), "Writer must be allowed to send input");
+}
+
+/// A non-Writer client is rejected with a `not Writer` error.
+#[test]
+fn write_lock_non_writer_rejected() {
+    let registry = SessionRegistry::new();
+    registry
+        .create_session("ws2".to_string(), "cat", &[], "writer-a".to_string())
+        .expect("create_session failed");
+
+    // A different caller id → not the Writer.
+    let err = registry
+        .write_input("ws2", "observer-b", b"hello\n")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not Writer"),
+        "Non-Writer must be rejected; got: {err}"
+    );
+}
+
+/// Observers (non-Writers) can still take Snapshots.
+///
+/// This verifies that the Write Lock only gates input, not reads.
+#[test]
+fn write_lock_observer_can_snapshot() {
+    let registry = SessionRegistry::new();
+    registry
+        .create_session(
+            "ws3".to_string(),
+            "echo",
+            &["hello"],
+            "writer-a".to_string(),
+        )
+        .expect("create_session failed");
+
+    // Give the session a moment to produce output.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // Any caller id (including "observer-b") can take a Snapshot — no auth needed.
+    let snap = registry
+        .take_snapshot("ws3")
+        .expect("Observer must be able to take Snapshot");
+    assert!(
+        snap.contains("hello"),
+        "Observer Snapshot must contain 'hello'; got:\n{}",
+        snap.text()
+    );
+}
+
+/// `write_input` on an unknown session id returns `no Session with id` error.
+#[test]
+fn write_lock_unknown_session_errors() {
+    let registry = SessionRegistry::new();
+    let err = registry
+        .write_input("nonexistent", "writer-a", b"data\n")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("no Session with id"),
+        "Unknown session must give 'no Session with id' error; got: {err}"
+    );
 }
 
 // ── HTTP integration tests ───────────────────────────────────────────────────
