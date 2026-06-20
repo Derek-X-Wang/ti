@@ -131,6 +131,57 @@ async fn mcp_notify(
     );
 }
 
+/// Perform the MCP handshake (initialize + initialized notification) and return
+/// the `mcp-session-id` header value.
+///
+/// Every stateful MCP test starts with this three-step sequence. Factored out
+/// here so each test only states what is unique to it (the tool call being
+/// tested), not the boilerplate setup.
+async fn mcp_init(client: &reqwest::Client, url: &str) -> Option<String> {
+    let init_resp = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("Authorization", format!("Bearer {DEV_TOKEN}"))
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": { "name": "test-driving-agent", "version": "0.0.0" }
+            }
+        }))
+        .send()
+        .await
+        .expect("initialize request failed");
+
+    assert_eq!(
+        init_resp.status(),
+        200,
+        "initialize must succeed with correct token"
+    );
+
+    let mcp_session_id = init_resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    // Drain the body — we only need the mcp-session-id from the header.
+    let _ = init_resp.text().await.unwrap_or_default();
+
+    mcp_notify(
+        client,
+        url,
+        DEV_TOKEN,
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized", "params": {} }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    mcp_session_id
+}
+
 // ── Unit tests for SessionRegistry ──────────────────────────────────────────
 
 /// The SessionRegistry creates a Session and lets callers snapshot it.
@@ -254,6 +305,128 @@ fn write_lock_unknown_session_errors() {
     );
 }
 
+// ── Unit tests for read_output ───────────────────────────────────────────────
+
+/// Registry read_output returns the raw bytes produced by a Session.
+///
+/// `echo hello` produces at least "hello\r\n" on the PTY. After waiting for
+/// the process to exit (draining the buffer), `read_output(0)` must contain
+/// "hello" and the offset must be 0.
+#[test]
+fn registry_read_output_returns_raw_bytes() {
+    let registry = SessionRegistry::new();
+    registry
+        .create_session(
+            "ro1".to_string(),
+            "echo",
+            &["hello"],
+            "writer-a".to_string(),
+        )
+        .expect("create_session failed");
+
+    // Give the session time to produce output and exit.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let chunk = registry.read_output("ro1", 0).expect("read_output failed");
+
+    assert_eq!(chunk.offset, 0, "first read must start at offset 0");
+    assert!(
+        chunk.data.windows(5).any(|w| w == b"hello"),
+        "raw output must contain 'hello'; got: {:?}",
+        String::from_utf8_lossy(&chunk.data)
+    );
+}
+
+/// read_output supports offset-based paging: reading from the next_offset
+/// after the first chunk returns an empty result (no more new output).
+#[test]
+fn registry_read_output_paging() {
+    let registry = SessionRegistry::new();
+    registry
+        .create_session(
+            "ro2".to_string(),
+            "echo",
+            &["world"],
+            "writer-a".to_string(),
+        )
+        .expect("create_session failed");
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let chunk = registry.read_output("ro2", 0).expect("first read failed");
+    assert!(!chunk.data.is_empty(), "first chunk must not be empty");
+
+    // Reading from next_offset returns empty (no new output after process exited).
+    // The returned offset must equal next — the caller's cursor is preserved.
+    let next = chunk.offset + chunk.data.len() as u64;
+    let empty = registry
+        .read_output("ro2", next)
+        .expect("second read failed");
+    assert_eq!(
+        empty.offset, next,
+        "offset must be preserved when no new data"
+    );
+    assert!(
+        empty.data.is_empty(),
+        "reading at end must return empty; got: {:?}",
+        String::from_utf8_lossy(&empty.data)
+    );
+}
+
+/// read_output on an unknown session id returns the standard error.
+#[test]
+fn registry_read_output_unknown_session_errors() {
+    let registry = SessionRegistry::new();
+    let err = registry.read_output("nonexistent", 0).unwrap_err();
+    assert!(err.to_string().contains("no Session with id"));
+}
+
+/// read_output captures output that scrolled off the visible screen.
+///
+/// Runs `printf '%s\n' {1..50}` to produce 50 lines (more than one 24-row
+/// screen). Asserts that read_output returns all 50 lines while take_snapshot
+/// only shows the last 24 (or fewer, depending on the shell prompt).
+#[test]
+fn read_output_captures_scrolled_off_content() {
+    // Generate 50 numbered lines via a shell one-liner.
+    let registry = SessionRegistry::new();
+    // Use sh -c so we get a shell to evaluate the brace expansion.
+    registry
+        .create_session(
+            "ro3".to_string(),
+            "sh",
+            &["-c", "for i in $(seq 1 50); do echo line$i; done"],
+            "writer-a".to_string(),
+        )
+        .expect("create_session failed");
+
+    // Give the process time to run and exit.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let chunk = registry.read_output("ro3", 0).expect("read_output failed");
+    let text = String::from_utf8_lossy(&chunk.data);
+
+    // All 50 lines must appear in the raw output.
+    assert!(
+        text.contains("line1"),
+        "raw output must contain 'line1'; got (first 200 chars): {:?}",
+        &text[..text.len().min(200)]
+    );
+    assert!(
+        text.contains("line50"),
+        "raw output must contain 'line50'; got (last 200 chars): {:?}",
+        &text[text.len().saturating_sub(200)..]
+    );
+
+    // The visible Snapshot (24 rows) should NOT contain line1 (it scrolled off).
+    let snap = registry.take_snapshot("ro3").expect("take_snapshot failed");
+    assert!(
+        !snap.contains("line1"),
+        "Snapshot must not contain scrolled-off 'line1'; got:\n{}",
+        snap.text()
+    );
+}
+
 // ── HTTP integration tests ───────────────────────────────────────────────────
 
 /// Bearer Token auth: missing token → 401.
@@ -307,53 +480,9 @@ async fn auth_rejects_wrong_token() {
 async fn create_session_and_take_snapshot_via_mcp() {
     let (client, url, ct) = spawn_daemon(DEV_TOKEN).await;
 
-    // Step 1: initialize — extract the mcp-session-id header.
-    let init_body = json!({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {
-            "protocolVersion": "2025-03-26",
-            "capabilities": {},
-            "clientInfo": { "name": "test-driving-agent", "version": "0.0.0" }
-        }
-    });
+    let mcp_session_id = mcp_init(&client, &url).await;
 
-    let init_resp = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json, text/event-stream")
-        .header("Authorization", format!("Bearer {DEV_TOKEN}"))
-        .json(&init_body)
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(
-        init_resp.status(),
-        200,
-        "initialize must succeed with correct token"
-    );
-
-    let mcp_session_id = init_resp
-        .headers()
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-
-    // Drain the response body (may be JSON or SSE; we just need the session id
-    // from the header, which we already captured above).
-    let _body = init_resp.text().await.unwrap_or_default();
-
-    // Step 2: notifications/initialized (a notification — no id, no JSON response).
-    mcp_notify(
-        &client,
-        &url,
-        DEV_TOKEN,
-        json!({ "jsonrpc": "2.0", "method": "notifications/initialized", "params": {} }),
-        mcp_session_id.as_deref(),
-    )
-    .await;
-
-    // Step 3: create_session — spawn `echo hello` as the Hosted Process.
+    // create_session — spawn `echo hello` as the Hosted Process.
     let cs_resp = mcp_post(
         &client,
         &url,
@@ -414,6 +543,65 @@ async fn create_session_and_take_snapshot_via_mcp() {
     assert!(
         snap_text.contains("[cursor"),
         "Snapshot must contain cursor info; got:\n{snap_text}"
+    );
+
+    ct.cancel();
+}
+
+/// Full MCP flow: initialize → create_session → read_output returns raw bytes.
+///
+/// Spawns `echo hello` and calls `read_output(since=0)` to verify the raw
+/// byte history is accessible over the full MCP HTTP stack.
+#[tokio::test]
+async fn read_output_via_mcp() {
+    let (client, url, ct) = spawn_daemon(DEV_TOKEN).await;
+
+    let mcp_session_id = mcp_init(&client, &url).await;
+
+    // create_session with echo hello.
+    mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "create_session",
+                "arguments": { "session_id": "ro-mcp", "program": "echo", "args": ["hello"] }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // read_output from offset 0.
+    let ro_resp = mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "read_output",
+                "arguments": { "session_id": "ro-mcp", "since": 0 }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    let ro_text = ro_resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        ro_text.contains("[offset=0"),
+        "response must contain offset header; got:\n{ro_text}"
+    );
+    assert!(
+        !ro_text.is_empty(),
+        "read_output must return non-empty result; got:\n{ro_text}"
     );
 
     ct.cancel();

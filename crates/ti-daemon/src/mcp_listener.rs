@@ -8,6 +8,8 @@
 //!   becomes the Session's Writer (holds the Write Lock).
 //! - `take_snapshot` — returns the text Snapshot (visible-screen plain text +
 //!   cursor) for a given session id. Available to Writers and Observers alike.
+//! - `read_output` — returns raw bytes from the Session's output history since
+//!   a given byte offset, covering scrolled-off content beyond the visible screen.
 //!
 //! ## Write Lock
 //!
@@ -61,6 +63,19 @@ pub struct CreateSessionInput {
 pub struct TakeSnapshotInput {
     /// The id of the Session to snapshot — as returned by `create_session`.
     pub session_id: String,
+}
+
+/// Input schema for the `read_output` MCP tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReadOutputInput {
+    /// The id of the Session to read output from.
+    pub session_id: String,
+
+    /// Byte offset to read from. Pass `0` for the full history since session
+    /// start. Use the `next_offset` from a previous `read_output` response to
+    /// page forward without re-reading old bytes.
+    #[serde(default)]
+    pub since: u64,
 }
 
 /// The MCP Server handler embedded in the TI Daemon.
@@ -178,6 +193,40 @@ impl McpListener {
             })
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
+
+    /// Read raw output from a Session's output history.
+    ///
+    /// Returns all bytes from `since` (a byte offset) to the current end of the
+    /// output stream, along with the starting offset and the next offset for
+    /// pagination. Covers scrolled-off content that avt's thin visible screen
+    /// does not retain (see ADR-0002).
+    ///
+    /// Retention policy: all output since session start is kept in memory for the
+    /// lifetime of the Session. No cap is applied in v1.
+    #[tool(
+        description = "Return raw output from a Session's history since a byte offset. \
+                       Use next_offset from the response to page forward."
+    )]
+    fn read_output(
+        &self,
+        Parameters(ReadOutputInput { session_id, since }): Parameters<ReadOutputInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.registry
+            .read_output(&session_id, since)
+            .map(|chunk| {
+                // Decode raw bytes to text here — at the MCP boundary where the
+                // text-content constraint is known. `ti-core` stays byte-agnostic.
+                let text = String::from_utf8_lossy(&chunk.data);
+                let byte_count = chunk.data.len() as u64;
+                let next_offset = chunk.offset + byte_count;
+                let body = format!(
+                    "[offset={} next_offset={} bytes={}]\n{}",
+                    chunk.offset, next_offset, byte_count, text,
+                );
+                CallToolResult::success(vec![Content::text(body)])
+            })
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+    }
 }
 
 /// Wire the tool router into `ServerHandler` so `tools/list` and `tools/call`
@@ -189,7 +238,9 @@ impl ServerHandler for McpListener {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "TI Daemon — headless terminal. \
                  Use create_session to spawn a Hosted Process, \
-                 then take_snapshot to read the visible screen.",
+                 take_snapshot to read the visible screen, \
+                 and read_output to page through the full output history \
+                 (including content scrolled off the visible screen).",
         )
     }
 }
