@@ -20,5 +20,7 @@ xcuserdata/
 # Local scratch (issue-tracker fallback, not tracked)
 .scratch/
 
-# Claude Code runtime artifacts
-.claude/
+# Claude Code — track config (agents/), ignore runtime artifacts
+.claude/scheduled_tasks.lock
+.claude/*.lock
+.claude/worktrees/
