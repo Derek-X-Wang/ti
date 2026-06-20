@@ -9,6 +9,7 @@ pub mod registry;
 
 pub use mcp_listener::McpListener;
 pub use registry::{SessionInfo, SessionRegistry};
+pub use ti_core::StyledSnapshot;
 
 /// Axum middleware that enforces Bearer Token authentication on every request.
 ///

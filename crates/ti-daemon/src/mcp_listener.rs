@@ -7,7 +7,8 @@
 //!   it under a stable id, and returns that id. The creating client automatically
 //!   becomes the Session's Writer (holds the Write Lock).
 //! - `take_snapshot` — returns the text Snapshot (visible-screen plain text +
-//!   cursor) for a given session id. Available to Writers and Observers alike.
+//!   cursor) for a given session id. Pass `include_styles: true` for per-cell
+//!   color/attribute data and the alt-screen flag. Available to all callers.
 //! - `read_output` — returns raw bytes from the Session's output history since
 //!   a given byte offset, covering scrolled-off content beyond the visible screen.
 //! - `send_keys` — types keystrokes into the Hosted Process via the Write Lock;
@@ -16,6 +17,7 @@
 //!   and alive/exited status.
 //! - `close_session` — terminates a Session's Hosted Process and removes it from
 //!   the registry; only the Writer may close.
+//! - `resize` — resize the PTY and emulator to new `cols` × `rows` dimensions.
 //!
 //! ## Write Lock
 //!
@@ -69,6 +71,22 @@ pub struct CreateSessionInput {
 pub struct TakeSnapshotInput {
     /// The id of the Session to snapshot — as returned by `create_session`.
     pub session_id: String,
+
+    /// When `true`, return per-cell color and attribute data (a [`StyledSnapshot`])
+    /// plus the alt-screen flag. Default is `false` (plain-text Snapshot only).
+    #[serde(default)]
+    pub include_styles: bool,
+}
+
+/// Input schema for the `resize` MCP tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ResizeInput {
+    /// The id of the Session to resize.
+    pub session_id: String,
+    /// New PTY width in columns.
+    pub cols: u16,
+    /// New PTY height in rows.
+    pub rows: u16,
 }
 
 /// Input schema for the `read_output` MCP tool.
@@ -239,28 +257,68 @@ impl McpListener {
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
 
-    /// Capture the current visible-screen text Snapshot of a Session.
+    /// Capture the current visible-screen Snapshot of a Session.
     ///
-    /// Returns the plain-text contents of the visible screen followed by the
-    /// cursor position. The Driving Agent uses this to "see" what is on screen
-    /// in the Hosted Process.
-    #[tool(
-        description = "Return the visible-screen text Snapshot (plain text + cursor) for a Session."
-    )]
+    /// By default returns the plain-text screen contents and cursor position.
+    /// Pass `include_styles: true` to instead return the full structured
+    /// [`StyledSnapshot`] as JSON: per-cell character + foreground/background
+    /// color + attributes for every visible row, plus cursor position and the
+    /// alt-screen flag. Use the styled form to reason about colors or paint a
+    /// faithful replica; the plain-text form is smaller and simpler.
+    #[tool(description = "Return the visible-screen Snapshot for a Session. \
+                       Pass include_styles=true to return structured per-cell color/attribute JSON.")]
     fn take_snapshot(
         &self,
-        Parameters(TakeSnapshotInput { session_id }): Parameters<TakeSnapshotInput>,
+        Parameters(TakeSnapshotInput {
+            session_id,
+            include_styles,
+        }): Parameters<TakeSnapshotInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if include_styles {
+            self.registry
+                .take_snapshot_styled(&session_id)
+                .and_then(|snap| {
+                    serde_json::to_string(&snap)
+                        .map_err(|e| anyhow::anyhow!("failed to serialize styled snapshot: {e}"))
+                })
+                .map(|json| CallToolResult::success(vec![Content::text(json)]))
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+        } else {
+            self.registry
+                .take_snapshot(&session_id)
+                .map(|snap| {
+                    let body = format!(
+                        "{}\n[cursor col={} row={} visible={}]",
+                        snap.text(),
+                        snap.cursor_col,
+                        snap.cursor_row,
+                        snap.cursor_visible,
+                    );
+                    CallToolResult::success(vec![Content::text(body)])
+                })
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+        }
+    }
+
+    /// Resize the PTY and emulator of a Session to new dimensions.
+    ///
+    /// Sends `SIGWINCH` to the Hosted Process and updates the avt screen buffer
+    /// to the new `cols` × `rows` size. TUIs and shells will reflow their output
+    /// to fit the new dimensions. Available to all callers.
+    #[tool(description = "Resize a Session's PTY and emulator to cols × rows. \
+                       Sends SIGWINCH to the Hosted Process so TUIs reflow.")]
+    fn resize(
+        &self,
+        Parameters(ResizeInput {
+            session_id,
+            cols,
+            rows,
+        }): Parameters<ResizeInput>,
     ) -> Result<CallToolResult, ErrorData> {
         self.registry
-            .take_snapshot(&session_id)
-            .map(|snap| {
-                let body = format!(
-                    "{}\n[cursor col={} row={} visible={}]",
-                    snap.text(),
-                    snap.cursor_col,
-                    snap.cursor_row,
-                    snap.cursor_visible,
-                );
+            .resize(&session_id, cols, rows)
+            .map(|()| {
+                let body = format!("resized session '{session_id}' to {cols}×{rows}");
                 CallToolResult::success(vec![Content::text(body)])
             })
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
@@ -389,9 +447,10 @@ impl ServerHandler for McpListener {
             "TI Daemon — headless terminal. \
                  Use create_session to spawn a Hosted Process, \
                  send_keys to type input (only the Writer may do this), \
-                 take_snapshot to read the visible screen, \
+                 take_snapshot to read the visible screen (pass include_styles=true for color data), \
                  read_output to page through the full output history \
                  (including content scrolled off the visible screen), \
+                 resize to change the PTY dimensions, \
                  list_sessions to enumerate active Sessions, \
                  and close_session to terminate and remove a Session.",
         )

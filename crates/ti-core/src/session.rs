@@ -5,12 +5,14 @@
 //! Inspector connects to. See CONTEXT.md for full glossary definitions.
 
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
 use avt::Vt;
-use portable_pty::{native_pty_system, CommandBuilder, ExitStatus, PtySize};
+use portable_pty::{native_pty_system, CommandBuilder, ExitStatus, MasterPty, PtySize};
 
+use crate::snapshot::{Attrs, Color, StyledCell, StyledSnapshot};
 use crate::Snapshot;
 
 /// Default PTY dimensions used when none are specified.
@@ -67,6 +69,12 @@ pub struct OutputChunk {
 pub struct Session {
     /// avt virtual terminal — the visible screen buffer.
     vt: Arc<Mutex<Vt>>,
+    /// PTY master — needed for `resize()`. Also owns the underlying fd.
+    ///
+    /// Held for the Session lifetime so we can resize the PTY without keeping
+    /// the writer and reader references dangling. `take_writer` and
+    /// `try_clone_reader` are called during `spawn` before we store this.
+    master: Box<dyn MasterPty + Send>,
     /// PTY master writer — sends bytes into the Hosted Process's stdin.
     ///
     /// `portable_pty` allows only one writer to be taken per PTY master, so we
@@ -87,10 +95,20 @@ pub struct Session {
     /// which guarantees all PTY output is in the screen buffer before a
     /// post-wait Snapshot is taken — no sleep needed.
     reader_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
-    /// PTY columns set at spawn time. Read-only in v1; resize is not yet supported.
-    pub cols: u16,
-    /// PTY rows set at spawn time. Read-only in v1; resize is not yet supported.
-    pub rows: u16,
+    /// PTY columns at last spawn/resize. Updated by [`Session::resize`].
+    cols: AtomicU16,
+    /// PTY rows at last spawn/resize. Updated by [`Session::resize`].
+    rows: AtomicU16,
+    /// `true` when the Hosted Process is in the alternate screen buffer.
+    ///
+    /// Tracked by scanning for the private mode sequences emitted by TUIs
+    /// (`\x1b[?47h/l`, `\x1b[?1047h/l`, `\x1b[?1049h/l`) in the reader
+    /// thread. Exposed via [`StyledSnapshot::alt_screen`].
+    ///
+    /// Uses `AtomicBool` (Release store / Acquire load) — the reader thread is
+    /// the sole writer so no mutex is needed; the Release/Acquire pair ensures the
+    /// last transition is visible to a reader before it inspects `alt_screen`.
+    alt_screen: Arc<AtomicBool>,
 }
 
 impl Session {
@@ -151,11 +169,17 @@ impl Session {
             .context("failed to take PTY master writer")?;
         let writer = Arc::new(Mutex::new(pty_writer));
 
+        // Retain the master so we can call resize() later.
+        let master = pair.master;
+
         let vt = Arc::new(Mutex::new(Vt::new(cols as usize, rows as usize)));
         let vt_clone = Arc::clone(&vt);
 
         let output_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let output_buf_clone = Arc::clone(&output_buf);
+
+        let alt_screen: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let alt_screen_clone = Arc::clone(&alt_screen);
 
         let reader_thread = std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
@@ -169,6 +193,38 @@ impl Session {
                         if let Ok(mut vt) = vt_clone.lock() {
                             vt.feed_str(&text);
                         }
+                        // Track alternate-screen state by scanning for the three
+                        // private mode sequences that switch buffers. All target
+                        // sequences are pure ASCII, so we search the raw bytes
+                        // directly — no UTF-8 conversion needed and no risk of
+                        // misidentifying a UTF-8 continuation byte as ESC.
+                        //
+                        // Prefixes: ESC[?47, ESC[?1047, ESC[?1049 + 'h'(enter)/'l'(exit).
+                        //
+                        // Known limitation: a sequence split across two read() calls
+                        // (e.g., ESC arrives in one chunk, the rest in the next) will
+                        // be missed. In practice TUIs emit these in a single write(2)
+                        // so splits don't occur. avt tracks this internally but does
+                        // not yet expose `Vt::active_buffer_type()`.
+                        let enters: &[&[u8]] = &[b"\x1b[?47h", b"\x1b[?1047h", b"\x1b[?1049h"];
+                        let exits: &[&[u8]] = &[b"\x1b[?47l", b"\x1b[?1047l", b"\x1b[?1049l"];
+                        // Find the byte index of the LAST matching sequence in this
+                        // chunk. A chunk may contain both an enter and a later exit
+                        // (or vice versa); whichever occurs last determines the
+                        // resulting state, so a comparison — not a plain `else if` —
+                        // is required.
+                        let last_pos = |patterns: &[&[u8]]| -> Option<usize> {
+                            patterns
+                                .iter()
+                                .filter_map(|p| chunk.windows(p.len()).rposition(|w| w == *p))
+                                .max()
+                        };
+                        match (last_pos(enters), last_pos(exits)) {
+                            (Some(e), Some(x)) => alt_screen_clone.store(e > x, Ordering::Release),
+                            (Some(_), None) => alt_screen_clone.store(true, Ordering::Release),
+                            (None, Some(_)) => alt_screen_clone.store(false, Ordering::Release),
+                            (None, None) => {}
+                        }
                         // Accumulate raw bytes for read_output replay.
                         if let Ok(mut out) = output_buf_clone.lock() {
                             out.extend_from_slice(chunk);
@@ -181,12 +237,14 @@ impl Session {
 
         Ok(Self {
             vt,
+            master,
             writer,
             output_buf,
             child: Mutex::new(child),
             reader_thread: Mutex::new(Some(reader_thread)),
-            cols,
-            rows,
+            cols: AtomicU16::new(cols),
+            rows: AtomicU16::new(rows),
+            alt_screen,
         })
     }
 
@@ -210,6 +268,122 @@ impl Session {
             cursor_row: cursor.row,
             cursor_visible: cursor.visible,
         })
+    }
+
+    /// Capture a structured Snapshot including per-cell color and attribute data.
+    ///
+    /// Produces the same visible-screen state as [`Session::snapshot`] but with
+    /// richer per-cell data: foreground/background colors, bold/italic/underline
+    /// etc., and the alt-screen flag. Suitable for clients that need to paint a
+    /// faithful visual replica (e.g., the native Inspector).
+    ///
+    /// Safe to call at any time, including while the Hosted Process is running.
+    pub fn snapshot_styled(&self) -> anyhow::Result<StyledSnapshot> {
+        let vt = self
+            .vt
+            .lock()
+            .map_err(|_| anyhow::anyhow!("screen buffer lock poisoned"))?;
+
+        let cursor = vt.cursor();
+
+        let lines: Vec<Vec<StyledCell>> = vt
+            .view()
+            .map(|line| {
+                line.cells()
+                    .iter()
+                    .map(|cell| {
+                        let pen = cell.pen();
+                        StyledCell {
+                            ch: cell.char(),
+                            fg: pen.foreground().map(Color::from),
+                            bg: pen.background().map(Color::from),
+                            attrs: Attrs {
+                                bold: pen.is_bold(),
+                                faint: pen.is_faint(),
+                                italic: pen.is_italic(),
+                                underline: pen.is_underline(),
+                                blink: pen.is_blink(),
+                                inverse: pen.is_inverse(),
+                                strikethrough: pen.is_strikethrough(),
+                            },
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Read alt_screen while still holding the vt lock so the cell data and the
+        // alt-screen flag describe the same moment. The Acquire load pairs with the
+        // reader thread's Release store, so the flag's last transition is visible.
+        let alt_screen = self.alt_screen.load(Ordering::Acquire);
+        drop(vt);
+
+        Ok(StyledSnapshot {
+            lines,
+            cursor_col: cursor.col,
+            cursor_row: cursor.row,
+            cursor_visible: cursor.visible,
+            alt_screen,
+        })
+    }
+
+    /// Resize the PTY and the avt emulator to the given dimensions.
+    ///
+    /// Sends `SIGWINCH` to the Hosted Process (via the PTY kernel interface) and
+    /// updates the avt screen buffer dimensions. After this call, subsequent
+    /// Snapshots reflect the new width and height.
+    ///
+    /// This is a best-effort operation: if the Hosted Process has already exited
+    /// the resize still succeeds (the PTY fd may still be open), but the signal
+    /// will not be delivered to any live process.
+    pub fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
+        // Reject degenerate / pathological sizes. Zero is not a valid terminal
+        // dimension, and very large values would force huge emulator allocations.
+        const MAX_DIM: u16 = 10_000;
+        if cols == 0 || rows == 0 {
+            anyhow::bail!("resize dimensions must be non-zero (got {cols}×{rows})");
+        }
+        if cols > MAX_DIM || rows > MAX_DIM {
+            anyhow::bail!("resize dimensions exceed the {MAX_DIM} limit (got {cols}×{rows})");
+        }
+
+        // Hold the screen-buffer lock across BOTH the PTY resize and the avt
+        // resize. The PTY resize sends SIGWINCH, prompting TUIs to redraw; the
+        // reader thread must take this same lock to feed that redraw into avt, so
+        // holding it here guarantees the redraw is parsed against the NEW
+        // dimensions instead of racing the old ones.
+        let mut vt = self
+            .vt
+            .lock()
+            .map_err(|_| anyhow::anyhow!("screen buffer lock poisoned"))?;
+
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| anyhow::anyhow!("PTY resize failed: {e}"))?;
+        vt.resize(cols as usize, rows as usize);
+        drop(vt);
+
+        // Record the new dimensions so `cols()`/`rows()` (and SessionInfo via the
+        // registry) reflect the resize rather than the original spawn size.
+        self.cols.store(cols, Ordering::Relaxed);
+        self.rows.store(rows, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    /// Current PTY width in columns — reflects the latest [`Session::resize`].
+    pub fn cols(&self) -> u16 {
+        self.cols.load(Ordering::Relaxed)
+    }
+
+    /// Current PTY height in rows — reflects the latest [`Session::resize`].
+    pub fn rows(&self) -> u16 {
+        self.rows.load(Ordering::Relaxed)
     }
 
     /// Send raw bytes into the Hosted Process's stdin via the PTY master writer.
