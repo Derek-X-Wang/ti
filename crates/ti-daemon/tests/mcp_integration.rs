@@ -879,3 +879,196 @@ async fn list_and_close_via_mcp() {
 
     ct.cancel();
 }
+
+// ── Issue #6: structured Snapshot + resize ──────────────────────────────────
+
+/// Registry: take_snapshot_styled returns per-cell data for every visible line.
+#[test]
+fn registry_take_snapshot_styled_returns_cells() {
+    let registry = SessionRegistry::new();
+    registry
+        .create_session(
+            "ss1".to_string(),
+            "echo",
+            &["hello"],
+            "writer-a".to_string(),
+        )
+        .expect("create_session failed");
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let snap = registry
+        .take_snapshot_styled("ss1")
+        .expect("take_snapshot_styled failed");
+
+    // Styled snapshot must have the same row count as the text snapshot.
+    let text_snap = registry.take_snapshot("ss1").expect("text snapshot failed");
+    assert_eq!(
+        snap.lines.len(),
+        text_snap.lines.len(),
+        "styled lines count must match text lines count"
+    );
+
+    // Cursor + alt-screen fields must be present.
+    let _ = snap.cursor_col;
+    let _ = snap.cursor_row;
+    let _ = snap.cursor_visible;
+    let _ = snap.alt_screen;
+}
+
+/// Registry: resize changes the PTY dimensions reflected in a styled Snapshot.
+///
+/// Uses `cat` (long-running) so the PTY is live when resized.
+#[test]
+fn registry_resize_changes_dimensions() {
+    let registry = SessionRegistry::new();
+    registry
+        .create_session("rs1".to_string(), "cat", &[], "writer-a".to_string())
+        .expect("create_session failed");
+
+    registry.resize("rs1", 120, 40).expect("resize failed");
+
+    let snap = registry
+        .take_snapshot_styled("rs1")
+        .expect("take_snapshot_styled after resize failed");
+    assert_eq!(
+        snap.lines.len(),
+        40,
+        "after resize to 40 rows, styled snapshot must have 40 lines; got {}",
+        snap.lines.len()
+    );
+}
+
+/// Full MCP flow: take_snapshot with include_styles=true returns styled summary.
+#[tokio::test]
+async fn take_snapshot_styled_via_mcp() {
+    let (client, url, ct) = spawn_daemon(DEV_TOKEN).await;
+    let mcp_session_id = mcp_init(&client, &url).await;
+
+    mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "create_session",
+                "arguments": { "session_id": "styled-mcp", "program": "echo", "args": ["hi"] }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let snap_resp = mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "take_snapshot",
+                "arguments": { "session_id": "styled-mcp", "include_styles": true }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    let snap_text = snap_resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    // include_styles=true returns the full StyledSnapshot as JSON — assert the
+    // structured per-cell data is actually present, not just a summary line.
+    let parsed: serde_json::Value =
+        serde_json::from_str(snap_text).expect("styled snapshot must be valid JSON");
+    assert!(
+        parsed["lines"].is_array(),
+        "styled snapshot JSON must include per-cell `lines`; got:\n{snap_text}"
+    );
+    assert!(
+        parsed["alt_screen"].is_boolean(),
+        "styled snapshot JSON must include `alt_screen`; got:\n{snap_text}"
+    );
+    assert!(
+        parsed.get("cursor_col").is_some(),
+        "styled snapshot JSON must include cursor fields; got:\n{snap_text}"
+    );
+
+    ct.cancel();
+}
+
+/// Full MCP flow: resize changes the terminal dimensions.
+#[tokio::test]
+async fn resize_via_mcp() {
+    let (client, url, ct) = spawn_daemon(DEV_TOKEN).await;
+    let mcp_session_id = mcp_init(&client, &url).await;
+
+    mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "create_session",
+                "arguments": { "session_id": "resize-mcp", "program": "cat" }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    let resize_resp = mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "resize",
+                "arguments": { "session_id": "resize-mcp", "cols": 100, "rows": 30 }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    let resize_text = resize_resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        resize_text.contains("100") && resize_text.contains("30"),
+        "resize response must echo back new dimensions; got:\n{resize_text}"
+    );
+
+    ct.cancel();
+}
+
+/// Registry: resize rejects zero and oversized dimensions (issue #6, hardening).
+#[test]
+fn registry_resize_rejects_invalid_dimensions() {
+    let registry = SessionRegistry::new();
+    registry
+        .create_session("rz1".to_string(), "cat", &[], "writer-a".to_string())
+        .expect("create_session failed");
+
+    assert!(
+        registry.resize("rz1", 0, 24).is_err(),
+        "resize with 0 cols must be rejected"
+    );
+    assert!(
+        registry.resize("rz1", 80, 0).is_err(),
+        "resize with 0 rows must be rejected"
+    );
+    assert!(
+        registry.resize("rz1", 20_000, 24).is_err(),
+        "resize beyond the dimension cap must be rejected"
+    );
+    // A valid resize still succeeds afterward.
+    registry
+        .resize("rz1", 100, 30)
+        .expect("valid resize must succeed");
+}

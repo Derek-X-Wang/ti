@@ -29,7 +29,7 @@ use std::{
 };
 
 use anyhow::Context as _;
-use ti_core::{ExitStatus, OutputChunk, Session, Snapshot};
+use ti_core::{ExitStatus, OutputChunk, Session, Snapshot, StyledSnapshot};
 
 /// Holds a [`Session`] together with its Write Lock identity and metadata.
 struct SessionEntry {
@@ -166,6 +166,26 @@ impl SessionRegistry {
         entry.session.snapshot()
     }
 
+    /// Take a structured Snapshot of the Session including per-cell style data.
+    ///
+    /// Available to any caller — Writers and Observers alike. Returns an error
+    /// if no Session with this id exists or if the Snapshot fails.
+    pub fn take_snapshot_styled(&self, id: &str) -> anyhow::Result<StyledSnapshot> {
+        let map = self.lock()?;
+        let entry = Self::get_entry(&map, id)?;
+        entry.session.snapshot_styled()
+    }
+
+    /// Resize the PTY of the Session identified by `id` to `cols` × `rows`.
+    ///
+    /// Sends `SIGWINCH` to the Hosted Process and updates the avt screen buffer.
+    /// Available to any caller — resize is not guarded by the Write Lock in v1.
+    pub fn resize(&self, id: &str, cols: u16, rows: u16) -> anyhow::Result<()> {
+        let map = self.lock()?;
+        let entry = Self::get_entry(&map, id)?;
+        entry.session.resize(cols, rows)
+    }
+
     /// Read raw output from the Session's output history starting at `since`.
     ///
     /// `since` is a byte offset into the total output stream. Pass `0` for the
@@ -193,8 +213,8 @@ impl SessionRegistry {
             infos.push(SessionInfo {
                 id: id.clone(),
                 command: entry.command.clone(),
-                cols: entry.session.cols,
-                rows: entry.session.rows,
+                cols: entry.session.cols(),
+                rows: entry.session.rows(),
                 exit_status,
             });
         }
