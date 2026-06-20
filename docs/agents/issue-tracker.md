@@ -2,10 +2,7 @@
 
 Issues and PRDs for this repo live as GitHub issues. Use the `gh` CLI for all operations.
 
-> **Setup gap:** this repo is not yet a git repository and has no GitHub remote. Before
-> any `gh issue` command works, run `git init`, create a GitHub repo, and push. Until
-> then, skills that publish issues will fail — set up the remote first, or temporarily
-> fall back to local markdown under `.scratch/<feature>/`.
+Repo: [`Derek-X-Wang/ti`](https://github.com/Derek-X-Wang/ti) (public).
 
 ## Conventions
 

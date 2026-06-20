@@ -14,5 +14,4 @@ When a skill mentions a role (e.g. "apply the AFK-ready triage label"), use the 
 
 Edit the right-hand column to match whatever vocabulary you actually use.
 
-> These labels don't exist on GitHub yet (no repo). Create them once the remote is set
-> up: `gh label create needs-triage`, etc., or they can be created on first use.
+All five labels exist on `Derek-X-Wang/ti`.

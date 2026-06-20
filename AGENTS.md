@@ -8,9 +8,8 @@ See `CONTEXT.md` for domain language and `docs/adr/` for architecture decisions.
 
 ### Issue tracker
 
-Issues and PRDs are tracked as GitHub issues via the `gh` CLI. No git remote exists
-yet — `git init` + a pushed GitHub repo is required before `gh issue` works. See
-`docs/agents/issue-tracker.md`.
+Issues and PRDs are tracked as GitHub issues (`Derek-X-Wang/ti`) via the `gh` CLI.
+See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
