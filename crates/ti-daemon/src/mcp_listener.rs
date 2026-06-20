@@ -1,15 +1,25 @@
 //! [`McpListener`] — the MCP Server inside `ti-daemon`.
 //!
-//! Implements the rmcp [`ServerHandler`] trait, exposing two MCP tools to
-//! Driving Agents (see CONTEXT.md):
+//! Implements the rmcp [`ServerHandler`] trait, exposing MCP tools to Driving
+//! Agents (see CONTEXT.md):
 //!
 //! - `create_session` — spawns a Session (Hosted Process in a PTY), registers
-//!   it under a stable id, and returns that id.
+//!   it under a stable id, and returns that id. The creating client automatically
+//!   becomes the Session's Writer (holds the Write Lock).
 //! - `take_snapshot` — returns the text Snapshot (visible-screen plain text +
-//!   cursor) for a given session id.
+//!   cursor) for a given session id. Available to Writers and Observers alike.
+//!
+//! ## Write Lock
+//!
+//! Each `McpListener` instance is assigned a unique `client_id` at construction
+//! time. When `create_session` is called, `client_id` is stored as the Session's
+//! Writer in the [`SessionRegistry`]. Future write operations (send_keys, etc.)
+//! must pass `client_id` so the registry can enforce the Write Lock.
 //!
 //! The MCP listener is kept as a clean internal module over TI Core so other
 //! transports (stdio adapter, gRPC) can be layered later per ADR-0001.
+
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rmcp::{
     handler::server::router::tool::ToolRouter,
@@ -21,6 +31,13 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::registry::SessionRegistry;
+
+/// Monotonic counter used to generate unique `client_id` values.
+///
+/// Each [`McpListener`] instance (one per MCP client connection) gets a unique
+/// numeric id stamped at construction time. This avoids a dependency on `uuid`
+/// or `rand` while still guaranteeing uniqueness within a daemon process lifetime.
+static CLIENT_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Input schema for the `create_session` MCP tool.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -52,9 +69,18 @@ pub struct TakeSnapshotInput {
 /// pattern used by [`rmcp::transport::streamable_http_server::StreamableHttpService`]),
 /// but all instances share the same [`SessionRegistry`] — the registry is the
 /// daemon's single source of truth for Sessions.
+///
+/// `client_id` is unique per instance and is used as the Writer identity when
+/// creating Sessions. The Write Lock is enforced by [`SessionRegistry`].
 #[derive(Clone)]
 pub struct McpListener {
     registry: SessionRegistry,
+    /// Unique identity for this MCP client connection.
+    ///
+    /// Assigned at construction from a process-global counter. Stored as the
+    /// Session's `writer_id` in [`SessionRegistry`] when `create_session` is
+    /// called, establishing this client as the Session's Writer.
+    pub(crate) client_id: String,
     // The `#[tool_router]` macro reads this field at runtime to dispatch
     // `tools/list` and `tools/call`. The dead_code lint can't see through
     // macro-generated code, so we suppress it explicitly.
@@ -64,9 +90,36 @@ pub struct McpListener {
 
 impl McpListener {
     /// Create a new MCP listener backed by the given registry.
+    ///
+    /// Each call generates a unique `client_id` via a process-global counter.
     pub fn new(registry: SessionRegistry) -> Self {
+        let client_id = format!(
+            "client-{}",
+            CLIENT_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        Self::with_client_id(registry, client_id)
+    }
+
+    /// Create a new MCP listener with an explicit `client_id`.
+    ///
+    /// Intended for tests that need a deterministic, known Writer identity.
+    /// Scoped to `#[cfg(test)]` so production code always goes through `new`
+    /// with the counter-generated id — callers cannot impersonate another client.
+    #[cfg(test)]
+    pub fn with_client_id(registry: SessionRegistry, client_id: impl Into<String>) -> Self {
         Self {
             registry,
+            client_id: client_id.into(),
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    /// Internal constructor shared by `new` and the test-only `with_client_id`.
+    #[cfg(not(test))]
+    fn with_client_id(registry: SessionRegistry, client_id: impl Into<String>) -> Self {
+        Self {
+            registry,
+            client_id: client_id.into(),
             tool_router: Self::tool_router(),
         }
     }
@@ -78,7 +131,10 @@ impl McpListener {
     ///
     /// Returns the session id on success. The session id is stable for the
     /// lifetime of the daemon.
-    #[tool(description = "Spawn a Hosted Process in a PTY Session and return its session id.")]
+    #[tool(
+        description = "Spawn a Hosted Process in a PTY Session and return its session id. \
+                       The calling client becomes the Session's Writer and holds the Write Lock."
+    )]
     fn create_session(
         &self,
         Parameters(CreateSessionInput {
@@ -91,7 +147,7 @@ impl McpListener {
             .unwrap_or_else(|| "bash".to_string());
 
         self.registry
-            .create_session(session_id.clone(), &program, &[])
+            .create_session(session_id.clone(), &program, &[], self.client_id.clone())
             .map(|id| CallToolResult::success(vec![Content::text(id)]))
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
