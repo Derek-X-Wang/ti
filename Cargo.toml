@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/ti-core", "crates/ti-daemon"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+
+# Shared dependency versions are declared here and referenced with
+# `<dep>.workspace = true` from member crates, so versions stay in lockstep.
+# Slices add entries as they need them (e.g. avt, portable-pty, the MCP SDK).
+[workspace.dependencies]
+ti-core = { path = "crates/ti-core" }
