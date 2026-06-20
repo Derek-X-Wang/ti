@@ -3,4 +3,12 @@ name = "ti-core"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "ti-snapshot"
+path = "src/bin/ti-snapshot.rs"
+
 [dependencies]
+avt.workspace = true
+portable-pty.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
