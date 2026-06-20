@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
 use avt::Vt;
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{native_pty_system, CommandBuilder, ExitStatus, PtySize};
 
 use crate::Snapshot;
 
@@ -77,12 +77,20 @@ pub struct Session {
     /// Appended to by the reader thread; readable by callers via `read_output`.
     /// Protected by an `Arc<Mutex<…>>` so the reader thread and caller can share it.
     output_buf: Arc<Mutex<Vec<u8>>>,
-    /// Handle to the Hosted Process (so callers can wait for it).
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    /// Handle to the Hosted Process.
+    ///
+    /// Behind a `Mutex` so `try_exit_status` and `kill` can take `&self` (the
+    /// registry holds `Session` behind a shared lock; `&mut self` would require
+    /// a mutable borrow of the whole map entry).
+    child: Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
     /// Background reader thread. Wrapped in `Option` so `wait()` can join it,
     /// which guarantees all PTY output is in the screen buffer before a
     /// post-wait Snapshot is taken — no sleep needed.
-    reader_thread: Option<std::thread::JoinHandle<()>>,
+    reader_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// PTY columns set at spawn time. Read-only in v1; resize is not yet supported.
+    pub cols: u16,
+    /// PTY rows set at spawn time. Read-only in v1; resize is not yet supported.
+    pub rows: u16,
 }
 
 impl Session {
@@ -175,8 +183,10 @@ impl Session {
             vt,
             writer,
             output_buf,
-            child,
-            reader_thread: Some(reader_thread),
+            child: Mutex::new(child),
+            reader_thread: Mutex::new(Some(reader_thread)),
+            cols,
+            rows,
         })
     }
 
@@ -249,6 +259,34 @@ impl Session {
         })
     }
 
+    /// Non-blocking exit status check.
+    ///
+    /// Returns `Some(status)` if the Hosted Process has exited, `None` if it is
+    /// still running. Does not block; does not join the reader thread.
+    pub fn try_exit_status(&self) -> anyhow::Result<Option<ExitStatus>> {
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| anyhow::anyhow!("child lock poisoned"))?;
+        child
+            .try_wait()
+            .map_err(|e| anyhow::anyhow!("try_wait failed: {e}"))
+    }
+
+    /// Terminate the Hosted Process by sending it a kill signal.
+    ///
+    /// Does not wait for the process to exit or join the reader thread. After
+    /// `kill`, callers may call [`Session::wait`] to drain remaining PTY output.
+    pub fn kill(&self) -> anyhow::Result<()> {
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| anyhow::anyhow!("child lock poisoned"))?;
+        child
+            .kill()
+            .map_err(|e| anyhow::anyhow!("kill failed: {e}"))
+    }
+
     /// Wait for the Hosted Process to exit and for all PTY output to be emulated.
     ///
     /// Blocks until:
@@ -257,19 +295,27 @@ impl Session {
     ///
     /// After this returns, [`Session::snapshot`] reflects the complete final
     /// screen state with no timing dependency.
-    pub fn wait(&mut self) -> anyhow::Result<portable_pty::ExitStatus> {
-        let status = self
-            .child
-            .wait()
-            .context("failed to wait for Hosted Process")?;
+    pub fn wait(&self) -> anyhow::Result<ExitStatus> {
+        let status = {
+            let mut child = self
+                .child
+                .lock()
+                .map_err(|_| anyhow::anyhow!("child lock poisoned"))?;
+            child.wait().context("failed to wait for Hosted Process")?
+        };
 
         // Join the reader thread so we know all PTY output has been fed into avt
         // before the caller takes a Snapshot. This eliminates any need for a
         // sleep-based drain in callers.
-        if let Some(handle) = self.reader_thread.take() {
+        let handle = self
+            .reader_thread
+            .lock()
+            .map_err(|_| anyhow::anyhow!("reader_thread lock poisoned"))?
+            .take();
+        if let Some(h) = handle {
             // Ignore join errors — if the thread panicked, the buffer is already
             // in a partial state and the snapshot will reflect that.
-            let _ = handle.join();
+            let _ = h.join();
         }
 
         Ok(status)
@@ -288,7 +334,7 @@ mod tests {
     /// text Snapshot, all without any daemon or MCP layer.
     #[test]
     fn snapshot_contains_echo_output() {
-        let mut session =
+        let session =
             Session::spawn("echo", &["hello"], None, None).expect("failed to spawn Session");
 
         // Wait for `echo` to exit and for the reader thread to drain all PTY
@@ -310,7 +356,7 @@ mod tests {
     /// offset gets an empty result.
     #[test]
     fn read_output_returns_raw_bytes() {
-        let mut session =
+        let session =
             Session::spawn("echo", &["hello"], None, None).expect("failed to spawn Session");
 
         session.wait().expect("Hosted Process did not exit cleanly");

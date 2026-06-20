@@ -10,6 +10,12 @@
 //!   cursor) for a given session id. Available to Writers and Observers alike.
 //! - `read_output` — returns raw bytes from the Session's output history since
 //!   a given byte offset, covering scrolled-off content beyond the visible screen.
+//! - `send_keys` — types keystrokes into the Hosted Process via the Write Lock;
+//!   supports `<ANGLE>` notation for special keys (`<ENTER>`, `<TAB>`, `<ESC>`, …).
+//! - `list_sessions` — returns all active Sessions with id, command, dimensions,
+//!   and alive/exited status.
+//! - `close_session` — terminates a Session's Hosted Process and removes it from
+//!   the registry; only the Writer may close.
 //!
 //! ## Write Lock
 //!
@@ -78,6 +84,29 @@ pub struct ReadOutputInput {
     pub since: u64,
 }
 
+/// Input schema for the `send_keys` MCP tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SendKeysInput {
+    /// The id of the Session to type into.
+    pub session_id: String,
+
+    /// Sequence of key tokens to type. Each token is either:
+    /// - A literal string (e.g. `"echo hi"`) typed verbatim.
+    /// - A special key in `<ANGLE>` notation, e.g.:
+    ///   `<ENTER>` (CR), `<TAB>`, `<ESC>`, `<BACKSPACE>`, `<DEL>`,
+    ///   `<UP>`, `<DOWN>`, `<LEFT>`, `<RIGHT>`,
+    ///   `<HOME>`, `<END>`, `<PGUP>`, `<PGDN>`, `<F1>`…`<F12>`,
+    ///   `<CTRL-C>`, `<CTRL-D>`, `<CTRL-Z>`.
+    pub keys: Vec<String>,
+}
+
+/// Input schema for the `close_session` MCP tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CloseSessionInput {
+    /// The id of the Session to close. Only the Writer may close a Session.
+    pub session_id: String,
+}
+
 /// The MCP Server handler embedded in the TI Daemon.
 ///
 /// Each MCP client session gets its own [`McpListener`] instance (the factory
@@ -138,6 +167,49 @@ impl McpListener {
             tool_router: Self::tool_router(),
         }
     }
+}
+
+/// Convert a sequence of key tokens (including `<ANGLE>` special keys) to raw bytes.
+///
+/// Tokens that match a known `<ANGLE>` escape are replaced by their byte
+/// sequence. Everything else is passed through as UTF-8. Unknown `<ANGLE>`
+/// tokens are returned verbatim (no silent discard) so the caller sees them.
+fn encode_keys(keys: &[String]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for token in keys {
+        match token.as_str() {
+            "<ENTER>" => out.push(b'\r'),
+            "<TAB>" => out.push(b'\t'),
+            "<ESC>" => out.push(b'\x1b'),
+            "<BACKSPACE>" => out.push(b'\x7f'),
+            "<DEL>" => out.extend_from_slice(b"\x1b[3~"),
+            "<UP>" => out.extend_from_slice(b"\x1b[A"),
+            "<DOWN>" => out.extend_from_slice(b"\x1b[B"),
+            "<RIGHT>" => out.extend_from_slice(b"\x1b[C"),
+            "<LEFT>" => out.extend_from_slice(b"\x1b[D"),
+            "<HOME>" => out.extend_from_slice(b"\x1b[H"),
+            "<END>" => out.extend_from_slice(b"\x1b[F"),
+            "<PGUP>" => out.extend_from_slice(b"\x1b[5~"),
+            "<PGDN>" => out.extend_from_slice(b"\x1b[6~"),
+            "<F1>" => out.extend_from_slice(b"\x1bOP"),
+            "<F2>" => out.extend_from_slice(b"\x1bOQ"),
+            "<F3>" => out.extend_from_slice(b"\x1bOR"),
+            "<F4>" => out.extend_from_slice(b"\x1bOS"),
+            "<F5>" => out.extend_from_slice(b"\x1b[15~"),
+            "<F6>" => out.extend_from_slice(b"\x1b[17~"),
+            "<F7>" => out.extend_from_slice(b"\x1b[18~"),
+            "<F8>" => out.extend_from_slice(b"\x1b[19~"),
+            "<F9>" => out.extend_from_slice(b"\x1b[20~"),
+            "<F10>" => out.extend_from_slice(b"\x1b[21~"),
+            "<F11>" => out.extend_from_slice(b"\x1b[23~"),
+            "<F12>" => out.extend_from_slice(b"\x1b[24~"),
+            "<CTRL-C>" => out.push(b'\x03'),
+            "<CTRL-D>" => out.push(b'\x04'),
+            "<CTRL-Z>" => out.push(b'\x1a'),
+            other => out.extend_from_slice(other.as_bytes()),
+        }
+    }
+    out
 }
 
 #[tool_router]
@@ -227,6 +299,84 @@ impl McpListener {
             })
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
+
+    /// Type keystrokes into a Session's Hosted Process.
+    ///
+    /// Accepts a sequence of key tokens. Literal strings are typed verbatim;
+    /// special keys use `<ANGLE>` notation (e.g. `<ENTER>`, `<CTRL-C>`). Only
+    /// the Session's Writer may call this tool — the Write Lock is enforced by
+    /// the registry.
+    #[tool(
+        description = "Type keystrokes into a Session. Keys are a list of tokens: literals \
+                       are typed verbatim; use <ENTER>, <TAB>, <ESC>, <CTRL-C> etc. for \
+                       special keys. Only the Writer (session creator) may send keys."
+    )]
+    fn send_keys(
+        &self,
+        Parameters(SendKeysInput { session_id, keys }): Parameters<SendKeysInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let bytes = encode_keys(&keys);
+        self.registry
+            .write_input(&session_id, &self.client_id, &bytes)
+            .map(|()| {
+                CallToolResult::success(vec![Content::text(format!(
+                    "sent {} byte(s)",
+                    bytes.len()
+                ))])
+            })
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+    }
+
+    /// List all Sessions in the registry.
+    ///
+    /// Returns each Session's id, command, PTY dimensions (cols×rows), and
+    /// alive/exited status with exit code or signal name when available.
+    #[tool(
+        description = "List all Sessions with id, command, dimensions, and alive/exited status."
+    )]
+    fn list_sessions(&self) -> Result<CallToolResult, ErrorData> {
+        self.registry
+            .list_sessions()
+            .map(|infos| {
+                if infos.is_empty() {
+                    return CallToolResult::success(vec![Content::text("(no sessions)")]);
+                }
+                let mut lines = Vec::with_capacity(infos.len());
+                for info in &infos {
+                    let status = match &info.exit_status {
+                        None => "alive".to_string(),
+                        Some(s) => format!("exited ({})", s),
+                    };
+                    lines.push(format!(
+                        "{}\t{}\t{}x{}\t{}",
+                        info.id, info.command, info.cols, info.rows, status
+                    ));
+                }
+                CallToolResult::success(vec![Content::text(lines.join("\n"))])
+            })
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+    }
+
+    /// Terminate a Session's Hosted Process and remove it from the registry.
+    ///
+    /// Sends a kill signal to the Hosted Process (if still running) then removes
+    /// the Session. Only the Writer (the client that created the Session) may
+    /// close it.
+    #[tool(description = "Terminate a Session's Hosted Process and remove it. \
+                       Only the Writer (session creator) may close a Session.")]
+    fn close_session(
+        &self,
+        Parameters(CloseSessionInput { session_id }): Parameters<CloseSessionInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.registry
+            .close_session(&session_id, &self.client_id)
+            .map(|()| {
+                CallToolResult::success(vec![Content::text(format!(
+                    "closed session '{session_id}'"
+                ))])
+            })
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+    }
 }
 
 /// Wire the tool router into `ServerHandler` so `tools/list` and `tools/call`
@@ -238,9 +388,12 @@ impl ServerHandler for McpListener {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "TI Daemon — headless terminal. \
                  Use create_session to spawn a Hosted Process, \
+                 send_keys to type input (only the Writer may do this), \
                  take_snapshot to read the visible screen, \
-                 and read_output to page through the full output history \
-                 (including content scrolled off the visible screen).",
+                 read_output to page through the full output history \
+                 (including content scrolled off the visible screen), \
+                 list_sessions to enumerate active Sessions, \
+                 and close_session to terminate and remove a Session.",
         )
     }
 }

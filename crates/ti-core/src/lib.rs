@@ -15,3 +15,5 @@ pub mod snapshot;
 
 pub use session::{OutputChunk, Session};
 pub use snapshot::Snapshot;
+// Re-export so ti-daemon doesn't need a direct portable_pty dependency for ExitStatus.
+pub use portable_pty::ExitStatus;

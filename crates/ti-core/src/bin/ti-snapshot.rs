@@ -21,7 +21,7 @@ fn main() -> anyhow::Result<()> {
     let program = argv.remove(0);
     let args: Vec<&str> = argv.iter().map(String::as_str).collect();
 
-    let mut session = ti_core::Session::spawn(&program, &args, None, None)?;
+    let session = ti_core::Session::spawn(&program, &args, None, None)?;
 
     // wait() blocks until the Hosted Process exits AND the reader thread has
     // drained all remaining PTY output into avt — no sleep needed.

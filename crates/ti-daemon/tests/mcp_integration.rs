@@ -606,3 +606,276 @@ async fn read_output_via_mcp() {
 
     ct.cancel();
 }
+
+// ── Unit tests for send_keys / list_sessions / close_session ─────────────────
+
+/// `list_sessions` returns an entry for each created session.
+#[test]
+fn list_sessions_returns_all() {
+    let registry = SessionRegistry::new();
+    registry
+        .create_session("la1".to_string(), "echo", &["a"], "w1".to_string())
+        .expect("create la1 failed");
+    registry
+        .create_session("la2".to_string(), "echo", &["b"], "w2".to_string())
+        .expect("create la2 failed");
+
+    let sessions = registry.list_sessions().expect("list_sessions failed");
+    let ids: Vec<_> = sessions.iter().map(|s| s.id.as_str()).collect();
+    assert!(ids.contains(&"la1"), "list must contain la1; got: {ids:?}");
+    assert!(ids.contains(&"la2"), "list must contain la2; got: {ids:?}");
+
+    for s in &sessions {
+        assert_eq!(s.command, "echo", "command must be 'echo'");
+        assert_eq!(s.cols, 80, "default cols must be 80");
+        assert_eq!(s.rows, 24, "default rows must be 24");
+    }
+}
+
+/// After a Hosted Process exits, `list_sessions` reports an exit status.
+#[test]
+fn list_sessions_shows_exit_status() {
+    let registry = SessionRegistry::new();
+    registry
+        .create_session("le1".to_string(), "sh", &["-c", "exit 0"], "w1".to_string())
+        .expect("create le1 failed");
+
+    // Give the process time to exit.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let sessions = registry.list_sessions().expect("list_sessions failed");
+    let entry = sessions
+        .iter()
+        .find(|s| s.id == "le1")
+        .expect("le1 not found");
+    assert!(
+        entry.exit_status.is_some(),
+        "process should have exited; exit_status was None"
+    );
+}
+
+/// `close_session` removes the session from the registry.
+#[test]
+fn close_session_removes_entry() {
+    let registry = SessionRegistry::new();
+    registry
+        .create_session("cl1".to_string(), "cat", &[], "writer-a".to_string())
+        .expect("create cl1 failed");
+
+    registry
+        .close_session("cl1", "writer-a")
+        .expect("close_session failed");
+
+    // Session is gone — take_snapshot must error.
+    let err = registry.take_snapshot("cl1").unwrap_err();
+    assert!(
+        err.to_string().contains("no Session with id"),
+        "closed session must be gone; got: {err}"
+    );
+}
+
+/// `close_session` by a non-Writer is rejected.
+#[test]
+fn close_session_non_writer_rejected() {
+    let registry = SessionRegistry::new();
+    registry
+        .create_session("cl2".to_string(), "cat", &[], "writer-a".to_string())
+        .expect("create cl2 failed");
+
+    let err = registry.close_session("cl2", "observer-b").unwrap_err();
+    assert!(
+        err.to_string().contains("not Writer"),
+        "Non-Writer must be rejected; got: {err}"
+    );
+}
+
+/// `write_input` is rejected when the Hosted Process has already exited.
+#[test]
+fn write_input_rejected_on_exited_session() {
+    let registry = SessionRegistry::new();
+    registry
+        .create_session(
+            "ex1".to_string(),
+            "sh",
+            &["-c", "exit 0"],
+            "writer-a".to_string(),
+        )
+        .expect("create ex1 failed");
+
+    // Give the process time to exit.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let err = registry
+        .write_input("ex1", "writer-a", b"hello\n")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("session exited"),
+        "write to exited session must error; got: {err}"
+    );
+}
+
+/// MCP flow: send_keys types 'echo hi<ENTER>' and snapshot shows 'hi'.
+#[tokio::test]
+async fn send_keys_via_mcp() {
+    let (client, url, ct) = spawn_daemon(DEV_TOKEN).await;
+
+    let mcp_session_id = mcp_init(&client, &url).await;
+
+    // create_session with bash.
+    mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "create_session",
+                "arguments": { "session_id": "sk1" }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    // Give the shell time to start.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // send_keys: echo hi + ENTER
+    let sk_resp = mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "send_keys",
+                "arguments": { "session_id": "sk1", "keys": ["echo hi", "<ENTER>"] }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    let sk_text = sk_resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        sk_text.contains("sent") && sk_text.contains("byte"),
+        "send_keys must confirm bytes sent; got: {sk_text}"
+    );
+
+    // Give the shell time to process and print output.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Snapshot should contain 'hi'.
+    let snap_resp = mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {
+                "name": "take_snapshot",
+                "arguments": { "session_id": "sk1" }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    let snap = snap_resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        snap.contains("hi"),
+        "Snapshot must contain 'hi' after send_keys echo hi<ENTER>; got:\n{snap}"
+    );
+
+    ct.cancel();
+}
+
+/// MCP flow: list_sessions returns created session; close_session removes it.
+#[tokio::test]
+async fn list_and_close_via_mcp() {
+    let (client, url, ct) = spawn_daemon(DEV_TOKEN).await;
+
+    let mcp_session_id = mcp_init(&client, &url).await;
+
+    // create_session.
+    mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "create_session", "arguments": { "session_id": "lc1" } }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    // list_sessions — should contain 'lc1'.
+    let list_resp = mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": { "name": "list_sessions", "arguments": {} }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    let list_text = list_resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        list_text.contains("lc1"),
+        "list_sessions must contain 'lc1'; got:\n{list_text}"
+    );
+
+    // close_session.
+    let close_resp = mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": { "name": "close_session", "arguments": { "session_id": "lc1" } }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    let close_text = close_resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        close_text.contains("closed"),
+        "close_session must confirm close; got:\n{close_text}"
+    );
+
+    // list_sessions — should no longer contain 'lc1'.
+    let list_resp2 = mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+            "params": { "name": "list_sessions", "arguments": {} }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    let list_text2 = list_resp2["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        !list_text2.contains("lc1"),
+        "after close, list_sessions must not contain 'lc1'; got:\n{list_text2}"
+    );
+
+    ct.cancel();
+}
