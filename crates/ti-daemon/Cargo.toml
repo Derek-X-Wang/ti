@@ -5,3 +5,16 @@ edition.workspace = true
 
 [dependencies]
 ti-core.workspace = true
+tokio.workspace = true
+axum.workspace = true
+rmcp.workspace = true
+serde.workspace = true
+schemars.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+serde_json = "1"
