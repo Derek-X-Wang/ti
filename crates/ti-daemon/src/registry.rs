@@ -26,7 +26,7 @@ use std::{
 };
 
 use anyhow::Context as _;
-use ti_core::{Session, Snapshot};
+use ti_core::{OutputChunk, Session, Snapshot};
 
 /// Holds a [`Session`] together with the id of its current Writer.
 struct SessionEntry {
@@ -121,6 +121,18 @@ impl SessionRegistry {
         let map = self.lock()?;
         let entry = Self::get_entry(&map, id)?;
         entry.session.snapshot()
+    }
+
+    /// Read raw output from the Session's output history starting at `since`.
+    ///
+    /// `since` is a byte offset into the total output stream. Pass `0` for the
+    /// full history, or the next offset from a previous call to page forward.
+    /// Returns an error if no Session with this id exists.
+    ///
+    /// See [`ti_core::OutputChunk`] for the retention policy and offset semantics.
+    pub fn read_output(&self, id: &str, since: u64) -> anyhow::Result<OutputChunk> {
+        let map = self.lock()?;
+        Self::get_entry(&map, id)?.session.read_output(since)
     }
 }
 

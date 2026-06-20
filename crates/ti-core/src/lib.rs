@@ -13,5 +13,5 @@
 pub mod session;
 pub mod snapshot;
 
-pub use session::Session;
+pub use session::{OutputChunk, Session};
 pub use snapshot::Snapshot;
