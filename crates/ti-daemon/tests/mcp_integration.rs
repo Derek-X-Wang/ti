@@ -1663,3 +1663,250 @@ async fn execute_command_demo_ls() {
 
     ct.cancel();
 }
+
+// ── Issue #10: dual-channel Observer socket + backpressure ────────────────────
+
+/// Unit: subscribe_observer returns a receiver that gets ScreenUpdates.
+///
+/// Subscribes an observer on a session that runs `echo hello`, then waits for
+/// at least one ScreenUpdate to arrive on the channel.
+#[test]
+fn observer_subscription_receives_screen_updates() {
+    let registry = SessionRegistry::new();
+    registry
+        .create_session(
+            "obs1".to_string(),
+            "echo",
+            &["hello world"],
+            "writer-a".to_string(),
+        )
+        .expect("create_session failed");
+
+    let rx = registry
+        .subscribe_observer("obs1")
+        .expect("subscribe_observer failed");
+
+    // Give echo a moment to produce output.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut got_update = false;
+    while std::time::Instant::now() < deadline {
+        if rx.try_recv().is_ok() {
+            got_update = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        got_update,
+        "observer must receive at least one ScreenUpdate before timeout"
+    );
+}
+
+/// Unit: a slow Observer channel (full) does not block the reader thread.
+///
+/// Creates a session with a bounded observer channel, fills the channel, then
+/// ensures the session continues to function (take_snapshot still works) even
+/// though the observer is not consuming.
+#[test]
+fn slow_observer_does_not_block_reader() {
+    let registry = SessionRegistry::new();
+    registry
+        .create_session(
+            "obs-slow".to_string(),
+            "sh",
+            &["-c", "for i in $(seq 1 50); do echo line$i; done"],
+            "writer-a".to_string(),
+        )
+        .expect("create_session failed");
+
+    let _rx = registry
+        .subscribe_observer("obs-slow")
+        .expect("subscribe_observer failed");
+    // Do NOT consume from _rx — this simulates a slow/stalled Observer.
+
+    // Give the session a moment to run and fill the bounded channel.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // The main thread must still be able to snapshot — reader must not be blocked.
+    let snap = registry
+        .take_snapshot("obs-slow")
+        .expect("take_snapshot must succeed even with stalled observer");
+    let _ = snap; // contents are not critical — we only care that it did not hang
+}
+
+/// Unit: unsubscribe_observer removes the channel; subsequent updates do not reach it.
+#[test]
+fn observer_unsubscribe_stops_updates() {
+    let registry = SessionRegistry::new();
+    registry
+        .create_session("obs-unsub".to_string(), "cat", &[], "writer-a".to_string())
+        .expect("create_session failed");
+
+    let handle = registry
+        .subscribe_observer("obs-unsub")
+        .expect("subscribe_observer failed");
+
+    let obs_id = handle.observer_id();
+    registry
+        .unsubscribe_observer("obs-unsub", obs_id)
+        .expect("unsubscribe_observer failed");
+
+    // Send input to trigger output — observer is already unsubscribed.
+    registry
+        .write_input("obs-unsub", "writer-a", b"echo afterunsub\r")
+        .expect("write_input failed");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // Drain whatever arrived before unsubscribe (may be zero).
+    while handle.try_recv().is_ok() {}
+    // After another brief wait there must be no new items.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        handle.try_recv().is_err(),
+        "unsubscribed observer must not receive new updates"
+    );
+}
+
+/// Integration: Observer socket server accepts a connection, attaches to a session,
+/// and streams ScreenUpdates over the socket.
+///
+/// Spawns the observer socket server, connects a socket client, sends the
+/// session_id as a newline-terminated string, and verifies that at least one
+/// newline-delimited JSON ScreenUpdate is received.
+#[tokio::test]
+async fn observer_socket_streams_screen_updates() {
+    use ti_daemon::observer_socket::ObserverSocketServer;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let registry = SessionRegistry::new();
+    registry
+        .create_session(
+            "obs-sock1".to_string(),
+            "sh",
+            &["-c", "for i in $(seq 1 5); do echo line$i; done; sleep 1"],
+            "writer-a".to_string(),
+        )
+        .expect("create_session failed");
+
+    // Bind observer socket on an OS-assigned path.
+    let socket_path = std::env::temp_dir().join(format!("ti-obs-test-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket_path); // clean up any stale socket
+
+    let server = ObserverSocketServer::bind(&socket_path, registry.clone())
+        .await
+        .expect("failed to bind observer socket");
+
+    let obs_ct = tokio_util::sync::CancellationToken::new();
+    tokio::spawn({
+        let ct = obs_ct.child_token();
+        async move { server.run(ct).await }
+    });
+
+    // Connect as an Observer and request the session.
+    let mut stream = tokio::net::UnixStream::connect(&socket_path)
+        .await
+        .expect("failed to connect to observer socket");
+
+    // Protocol: send "session_id\n" to attach.
+    stream
+        .write_all(b"obs-sock1\n")
+        .await
+        .expect("failed to send session_id");
+
+    // Expect at least one newline-delimited JSON object.
+    let mut reader = BufReader::new(&mut stream);
+    let mut line = String::new();
+    let read_result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        reader.read_line(&mut line),
+    )
+    .await;
+
+    obs_ct.cancel();
+    let _ = std::fs::remove_file(&socket_path);
+
+    let n = read_result
+        .expect("timed out waiting for ScreenUpdate from observer socket")
+        .expect("failed to read from observer socket");
+    assert!(n > 0, "observer socket must send at least one byte");
+    // Must be valid JSON.
+    let _: serde_json::Value =
+        serde_json::from_str(line.trim()).expect("ScreenUpdate must be valid JSON");
+}
+
+/// Integration: MCP Writer and socket Observer share the same Session concurrently.
+///
+/// Creates a session via the SessionRegistry (simulating the MCP path), attaches
+/// a socket Observer, then verifies both channels function simultaneously.
+#[tokio::test]
+async fn mcp_writer_and_observer_share_session() {
+    use ti_daemon::observer_socket::ObserverSocketServer;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let registry = SessionRegistry::new();
+    // Create a long-running session (tick loop) — simulates the MCP Writer path.
+    registry
+        .create_session(
+            "shared-sess".to_string(),
+            "sh",
+            &["-c", "while true; do echo tick; sleep 0.1; done"],
+            "mcp-writer".to_string(),
+        )
+        .expect("create shared-sess");
+
+    let socket_path =
+        std::env::temp_dir().join(format!("ti-shared-test-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket_path);
+
+    let server = ObserverSocketServer::bind(&socket_path, registry.clone())
+        .await
+        .expect("bind failed");
+
+    let obs_ct = tokio_util::sync::CancellationToken::new();
+    tokio::spawn({
+        let ct = obs_ct.child_token();
+        async move { server.run(ct).await }
+    });
+
+    // Connect observer while the session is producing output.
+    let mut stream = tokio::net::UnixStream::connect(&socket_path)
+        .await
+        .expect("connect failed");
+    stream
+        .write_all(b"shared-sess\n")
+        .await
+        .expect("write session id");
+
+    // MCP Writer takes a snapshot concurrently — must not be blocked.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let snap = registry
+        .take_snapshot("shared-sess")
+        .expect("snapshot failed");
+    assert!(
+        snap.contains("tick"),
+        "MCP snapshot must see tick output; got:\n{}",
+        snap.text()
+    );
+
+    // Observer must have received updates.
+    let mut reader = BufReader::new(&mut stream);
+    let mut line = String::new();
+    let read_result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        reader.read_line(&mut line),
+    )
+    .await;
+
+    obs_ct.cancel();
+    let _ = std::fs::remove_file(&socket_path);
+
+    let n = read_result
+        .expect("timeout waiting for observer update")
+        .expect("read error");
+    assert!(
+        n > 0,
+        "observer must receive output from the shared session"
+    );
+    let _: serde_json::Value =
+        serde_json::from_str(line.trim()).expect("observer update must be valid JSON");
+}

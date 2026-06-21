@@ -211,6 +211,45 @@ impl SessionRegistry {
         Self::get_entry(&map, id)?.session.output_len()
     }
 
+    /// Subscribe a new Observer to a Session's screen update stream.
+    ///
+    /// Returns an [`ti_core::ObserverHandle`] with `try_recv` and `observer_id`.
+    /// The Observer receives a bounded stream of [`ti_core::ScreenUpdate`]s (one
+    /// per PTY chunk, dropped if the channel is full — see
+    /// [`ti_core::OBSERVER_CHANNEL_CAPACITY`]).
+    pub fn subscribe_observer(&self, id: &str) -> anyhow::Result<ti_core::ObserverHandle> {
+        let map = self.lock()?;
+        Self::get_entry(&map, id)?.session.subscribe_observer()
+    }
+
+    /// Subscribe and atomically capture the current screen state.
+    ///
+    /// Delegates to [`ti_core::Session::subscribe_observer_with_snapshot`]. The
+    /// observer is registered and the initial [`StyledSnapshot`] is taken under the
+    /// same vt lock acquisition, preventing any PTY chunk from slipping between
+    /// subscription and snapshot (which would cause the client to observe time
+    /// going backwards in the update stream).
+    pub fn subscribe_observer_with_snapshot(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<(ti_core::ObserverHandle, StyledSnapshot)> {
+        let map = self.lock()?;
+        Self::get_entry(&map, id)?
+            .session
+            .subscribe_observer_with_snapshot()
+    }
+
+    /// Unsubscribe an Observer from a Session by observer id.
+    ///
+    /// Removes the sender so the session stops broadcasting to this handle.
+    /// The handle's receiver can still be drained but will receive no new updates.
+    pub fn unsubscribe_observer(&self, session_id: &str, observer_id: u64) -> anyhow::Result<()> {
+        let map = self.lock()?;
+        Self::get_entry(&map, session_id)?
+            .session
+            .unsubscribe_observer(observer_id)
+    }
+
     /// Return a summary of every Session in the registry.
     ///
     /// Each entry includes the session id, command name, PTY dimensions, and

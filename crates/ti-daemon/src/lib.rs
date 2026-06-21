@@ -5,11 +5,12 @@
 //! and drive it through the public API without spawning a subprocess.
 
 pub mod mcp_listener;
+pub mod observer_socket;
 pub mod registry;
 
 pub use mcp_listener::McpListener;
 pub use registry::{SessionInfo, SessionRegistry};
-pub use ti_core::StyledSnapshot;
+pub use ti_core::{ObserverHandle, ScreenUpdate, StyledSnapshot};
 
 /// Axum middleware that enforces Bearer Token authentication on every request.
 ///

@@ -5,7 +5,8 @@
 //! Inspector connects to. See CONTEXT.md for full glossary definitions.
 
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::mpsc::{self, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
@@ -18,6 +19,66 @@ use crate::Snapshot;
 /// Default PTY dimensions used when none are specified.
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
+
+/// Bounded observer channel capacity.
+///
+/// When the channel is full a new `ScreenUpdate` is **dropped** (non-blocking
+/// `try_send`). This prevents a slow or stalled Observer from blocking the
+/// reader thread, the PTY emulator, or any MCP tool.
+const OBSERVER_CHANNEL_CAPACITY: usize = 256;
+
+/// A point-in-time rendered screen state sent to Observers.
+///
+/// Each Observer receives a `ScreenUpdate` after every PTY chunk is processed.
+/// The initial frame is sent immediately on subscription; subsequent frames
+/// arrive as the Hosted Process produces output. Equivalent to a
+/// [`StyledSnapshot`] — carries the full visible screen plus cursor and
+/// alt-screen state so the Observer can paint a faithful replica without a
+/// second emulator.
+pub type ScreenUpdate = StyledSnapshot;
+
+/// Process-global monotonic counter for observer ids.
+static OBSERVER_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// The shared observer list type: a list of `(id, sender)` pairs.
+type ObserverList = Arc<Mutex<Vec<(u64, SyncSender<Arc<ScreenUpdate>>)>>>;
+
+/// A handle to an active observer subscription.
+///
+/// Returned by [`Session::subscribe_observer`]. Provides a `try_recv` method
+/// to poll for new [`ScreenUpdate`]s without blocking, and `observer_id` to
+/// identify this subscription for later [`Session::unsubscribe_observer`] calls.
+pub struct ObserverHandle {
+    id: u64,
+    rx: mpsc::Receiver<Arc<ScreenUpdate>>,
+}
+
+impl ObserverHandle {
+    /// The unique id of this observer subscription.
+    ///
+    /// Pass this to [`Session::unsubscribe_observer`] to detach.
+    pub fn observer_id(&self) -> u64 {
+        self.id
+    }
+
+    /// Non-blocking attempt to receive the next [`ScreenUpdate`].
+    ///
+    /// Returns `Ok(update)` if one is ready, or `Err(TryRecvError::Empty)` if
+    /// none is available yet. Returns `Err(TryRecvError::Disconnected)` if the
+    /// Session has ended and no further updates will arrive.
+    pub fn try_recv(&self) -> Result<Arc<ScreenUpdate>, TryRecvError> {
+        self.rx.try_recv()
+    }
+
+    /// Blocking receive — waits until the next [`ScreenUpdate`] arrives.
+    ///
+    /// Suitable for use in `std::thread::spawn` contexts where blocking is
+    /// acceptable. The iterator ends when the Session ends or the observer is
+    /// unsubscribed.
+    pub fn recv(self) -> impl Iterator<Item = Arc<ScreenUpdate>> {
+        self.rx.into_iter()
+    }
+}
 
 /// A slice of raw output from a Session's output history.
 ///
@@ -109,6 +170,47 @@ pub struct Session {
     /// the sole writer so no mutex is needed; the Release/Acquire pair ensures the
     /// last transition is visible to a reader before it inspects `alt_screen`.
     alt_screen: Arc<AtomicBool>,
+    /// Registered Observer channels.
+    ///
+    /// Each Observer gets a bounded `SyncSender`. The reader thread calls
+    /// `try_send` on every sender after each PTY chunk — non-blocking so a slow
+    /// Observer never stalls the reader. Dead senders (full or disconnected) are
+    /// silently skipped; `unsubscribe_observer` removes them by id.
+    observers: ObserverList,
+}
+
+/// Build the per-cell styled line data from an `avt::Vt` view.
+///
+/// Shared by `Session::snapshot_styled` and the reader thread's Observer
+/// broadcast — extracted here so the cell extraction logic has a single
+/// definition.
+///
+/// Caller must hold the `vt` lock.
+fn build_styled_lines(vt: &Vt) -> Vec<Vec<StyledCell>> {
+    vt.view()
+        .map(|line| {
+            line.cells()
+                .iter()
+                .map(|cell| {
+                    let pen = cell.pen();
+                    StyledCell {
+                        ch: cell.char(),
+                        fg: pen.foreground().map(Color::from),
+                        bg: pen.background().map(Color::from),
+                        attrs: Attrs {
+                            bold: pen.is_bold(),
+                            faint: pen.is_faint(),
+                            italic: pen.is_italic(),
+                            underline: pen.is_underline(),
+                            blink: pen.is_blink(),
+                            inverse: pen.is_inverse(),
+                            strikethrough: pen.is_strikethrough(),
+                        },
+                    }
+                })
+                .collect()
+        })
+        .collect()
 }
 
 impl Session {
@@ -181,6 +283,9 @@ impl Session {
         let alt_screen: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         let alt_screen_clone = Arc::clone(&alt_screen);
 
+        let observers: ObserverList = Arc::new(Mutex::new(Vec::new()));
+        let observers_clone = Arc::clone(&observers);
+
         let reader_thread = std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             loop {
@@ -188,11 +293,29 @@ impl Session {
                     Ok(0) => break, // EOF — Hosted Process exited and PTY drained
                     Ok(n) => {
                         let chunk = &buf[..n];
-                        // Feed into avt for visible-screen emulation.
-                        let text = String::from_utf8_lossy(chunk);
-                        if let Ok(mut vt) = vt_clone.lock() {
-                            vt.feed_str(&text);
-                        }
+                        // Check for active Observers before acquiring the vt lock so
+                        // we know whether to build the styled snapshot. The observer
+                        // list is checked with a brief lock that does NOT overlap the
+                        // vt lock — no ordering issue since these two locks are never
+                        // held simultaneously outside this reader thread.
+                        let has_observers = observers_clone.lock().is_ok_and(|obs| !obs.is_empty());
+
+                        // Feed into avt for visible-screen emulation. If Observers
+                        // exist, also capture a ScreenUpdate in the same lock window.
+                        let maybe_update = if let Ok(mut vt) = vt_clone.lock() {
+                            vt.feed_str(&String::from_utf8_lossy(chunk));
+                            // Only build the styled snapshot when Observers exist —
+                            // skip the O(rows×cols) work on the common cold path.
+                            if has_observers {
+                                let cursor = vt.cursor();
+                                Some((build_styled_lines(&vt), cursor))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
                         // Track alternate-screen state by scanning for the three
                         // private mode sequences that switch buffers. All target
                         // sequences are pure ASCII, so we search the raw bytes
@@ -219,15 +342,54 @@ impl Session {
                                 .filter_map(|p| chunk.windows(p.len()).rposition(|w| w == *p))
                                 .max()
                         };
-                        match (last_pos(enters), last_pos(exits)) {
-                            (Some(e), Some(x)) => alt_screen_clone.store(e > x, Ordering::Release),
-                            (Some(_), None) => alt_screen_clone.store(true, Ordering::Release),
-                            (None, Some(_)) => alt_screen_clone.store(false, Ordering::Release),
-                            (None, None) => {}
-                        }
+                        let alt = match (last_pos(enters), last_pos(exits)) {
+                            (Some(e), Some(x)) => {
+                                let v = e > x;
+                                alt_screen_clone.store(v, Ordering::Release);
+                                v
+                            }
+                            (Some(_), None) => {
+                                alt_screen_clone.store(true, Ordering::Release);
+                                true
+                            }
+                            (None, Some(_)) => {
+                                alt_screen_clone.store(false, Ordering::Release);
+                                false
+                            }
+                            (None, None) => alt_screen_clone.load(Ordering::Acquire),
+                        };
+
                         // Accumulate raw bytes for read_output replay.
                         if let Ok(mut out) = output_buf_clone.lock() {
                             out.extend_from_slice(chunk);
+                        }
+
+                        // Broadcast ScreenUpdate to all registered Observers.
+                        // Uses try_send — non-blocking so a full/slow Observer
+                        // channel never stalls the reader thread.
+                        //   Full → drop the update (backpressure/drop policy).
+                        //   Disconnected → prune the sender.
+                        // The update is wrapped in Arc so N observers share one
+                        // allocation rather than each getting a deep copy.
+                        if let Some((lines, cursor)) = maybe_update {
+                            let update = Arc::new(ScreenUpdate {
+                                lines,
+                                cursor_col: cursor.col,
+                                cursor_row: cursor.row,
+                                cursor_visible: cursor.visible,
+                                alt_screen: alt,
+                            });
+                            if let Ok(mut obs) = observers_clone.lock() {
+                                obs.retain(|(_, tx)| {
+                                    match tx.try_send(Arc::clone(&update)) {
+                                        Ok(()) => true,
+                                        // Channel full — drop this update, keep sender.
+                                        Err(mpsc::TrySendError::Full(_)) => true,
+                                        // Receiver dropped — remove this sender.
+                                        Err(mpsc::TrySendError::Disconnected(_)) => false,
+                                    }
+                                });
+                            }
                         }
                     }
                     Err(_) => break, // PTY closed unexpectedly
@@ -245,6 +407,7 @@ impl Session {
             cols: AtomicU16::new(cols),
             rows: AtomicU16::new(rows),
             alt_screen,
+            observers,
         })
     }
 
@@ -285,32 +448,7 @@ impl Session {
             .map_err(|_| anyhow::anyhow!("screen buffer lock poisoned"))?;
 
         let cursor = vt.cursor();
-
-        let lines: Vec<Vec<StyledCell>> = vt
-            .view()
-            .map(|line| {
-                line.cells()
-                    .iter()
-                    .map(|cell| {
-                        let pen = cell.pen();
-                        StyledCell {
-                            ch: cell.char(),
-                            fg: pen.foreground().map(Color::from),
-                            bg: pen.background().map(Color::from),
-                            attrs: Attrs {
-                                bold: pen.is_bold(),
-                                faint: pen.is_faint(),
-                                italic: pen.is_italic(),
-                                underline: pen.is_underline(),
-                                blink: pen.is_blink(),
-                                inverse: pen.is_inverse(),
-                                strikethrough: pen.is_strikethrough(),
-                            },
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
+        let lines = build_styled_lines(&vt);
 
         // Read alt_screen while still holding the vt lock so the cell data and the
         // alt-screen flag describe the same moment. The Acquire load pairs with the
@@ -446,6 +584,105 @@ impl Session {
             .lock()
             .map_err(|_| anyhow::anyhow!("output buffer lock poisoned"))?;
         Ok(buf.len() as u64)
+    }
+
+    /// Subscribe a new Observer to this Session's screen update stream.
+    ///
+    /// Returns an [`ObserverHandle`] that provides:
+    /// - `try_recv()` — non-blocking poll for the next [`ScreenUpdate`].
+    /// - `observer_id()` — the unique id to pass to [`Session::unsubscribe_observer`].
+    ///
+    /// The Observer immediately begins receiving [`ScreenUpdate`]s after each PTY
+    /// chunk is processed. **No initial screen state is sent through the channel.**
+    /// Callers that need the current screen before any new output should call
+    /// [`Session::snapshot_styled`] explicitly and then start consuming from the handle.
+    ///
+    /// Prefer [`Session::subscribe_observer_with_snapshot`] when an initial frame is
+    /// needed — it registers the observer and captures the snapshot atomically under the
+    /// vt lock, preventing any chunk from slipping between subscription and snapshot.
+    ///
+    /// The channel is bounded at [`OBSERVER_CHANNEL_CAPACITY`] items. When full,
+    /// new updates are **dropped** (not queued, not blocking). The Observer must
+    /// consume promptly to avoid missing frames.
+    pub fn subscribe_observer(&self) -> anyhow::Result<ObserverHandle> {
+        let (tx, rx) = mpsc::sync_channel::<Arc<ScreenUpdate>>(OBSERVER_CHANNEL_CAPACITY);
+        let id = OBSERVER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        self.observers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("observer list lock poisoned"))?
+            .push((id, tx));
+        Ok(ObserverHandle { id, rx })
+    }
+
+    /// Subscribe a new Observer and atomically capture the current screen state.
+    ///
+    /// Registers the observer and takes the initial [`ScreenUpdate`] snapshot
+    /// under the same vt lock acquisition, so no PTY chunk can be processed
+    /// between subscription and snapshot. This prevents the "time goes backwards"
+    /// race where:
+    ///   1. Observer subscribes (chunks start queuing).
+    ///   2. Some output is processed → queued on the handle.
+    ///   3. Caller takes a snapshot (shows state AFTER step 2).
+    ///   4. Caller sends snapshot as "initial frame", then drains the queue.
+    ///   5. Client sees the initial frame FOLLOWED by older queued frames → time reversal.
+    ///
+    /// With this method, the snapshot and the observer registration happen while the
+    /// reader thread cannot feed new chunks, so the initial frame is always ≤ any
+    /// subsequently queued frame.
+    pub fn subscribe_observer_with_snapshot(
+        &self,
+    ) -> anyhow::Result<(ObserverHandle, StyledSnapshot)> {
+        let (tx, rx) = mpsc::sync_channel::<Arc<ScreenUpdate>>(OBSERVER_CHANNEL_CAPACITY);
+        let id = OBSERVER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        // Hold the vt lock while registering. The reader thread acquires the same
+        // lock to feed chunks and build ScreenUpdates, so no chunk can slip between
+        // the snapshot and the registration.
+        let snapshot = {
+            let vt = self
+                .vt
+                .lock()
+                .map_err(|_| anyhow::anyhow!("screen buffer lock poisoned"))?;
+            let cursor = vt.cursor();
+            let lines = build_styled_lines(&vt);
+            let alt_screen = self.alt_screen.load(Ordering::Acquire);
+            // Register while still holding vt lock — reader thread is blocked.
+            self.observers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("observer list lock poisoned"))?
+                .push((id, tx));
+            StyledSnapshot {
+                lines,
+                cursor_col: cursor.col,
+                cursor_row: cursor.row,
+                cursor_visible: cursor.visible,
+                alt_screen,
+            }
+        };
+
+        Ok((ObserverHandle { id, rx }, snapshot))
+    }
+
+    /// Unsubscribe an Observer by id.
+    ///
+    /// Removes the sender associated with `observer_id` from this Session's
+    /// broadcast list. Subsequent PTY output will not be sent to it. The
+    /// [`ObserverHandle`]'s receiver remains valid — any updates already in the
+    /// channel can still be drained — but no new updates will arrive.
+    ///
+    /// Returns an error if the observer list lock is poisoned or if the id does
+    /// not exist in the list (no-op would be a programming error).
+    pub fn unsubscribe_observer(&self, observer_id: u64) -> anyhow::Result<()> {
+        let mut obs = self
+            .observers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("observer list lock poisoned"))?;
+        let before = obs.len();
+        obs.retain(|(id, _)| *id != observer_id);
+        if obs.len() == before {
+            anyhow::bail!("no observer with id {observer_id} in this session");
+        }
+        Ok(())
     }
 
     /// Non-blocking exit status check.
