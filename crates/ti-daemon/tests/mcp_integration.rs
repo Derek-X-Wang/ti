@@ -1072,3 +1072,390 @@ fn registry_resize_rejects_invalid_dimensions() {
         .resize("rz1", 100, 30)
         .expect("valid resize must succeed");
 }
+
+// ── Issue #8: wait_for_output ─────────────────────────────────────────────────
+
+/// wait_for_output returns reason=matched when the visible Snapshot contains the
+/// expected pattern before the timeout fires.
+///
+/// Spawns `sh -c "echo hello"` (deterministic output), waits for "hello" with a
+/// generous timeout. Pattern match must fire and result must include the Snapshot.
+#[tokio::test]
+async fn wait_for_output_matches_pattern() {
+    let (client, url, ct) = spawn_daemon(DEV_TOKEN).await;
+    let mcp_session_id = mcp_init(&client, &url).await;
+
+    // Spawn a session that produces "hello" then exits.
+    // Use program="sh" with no extra args — the shell starts, then we wait for
+    // its prompt, since create_session doesn't yet accept extra args.
+    // Instead: use a sh one-liner via the program field directly.
+    mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "create_session",
+                // Use the send_keys flow after spawning a shell, or use a
+                // program that prints text directly. Since create_session
+                // only accepts program (no args), we spawn a shell and send
+                // the command via send_keys instead. That is the realistic
+                // Driving Agent flow anyway.
+                "arguments": { "session_id": "wfo-pattern" }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    // Give the shell a moment to show its prompt.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Type "echo hello" + ENTER into the shell.
+    mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "send_keys",
+                "arguments": { "session_id": "wfo-pattern", "keys": ["echo hello", "<ENTER>"] }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    // wait_for_output with a pattern — must fire as "matched".
+    let resp = mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {
+                "name": "wait_for_output",
+                "arguments": {
+                    "session_id": "wfo-pattern",
+                    "pattern": "hello",
+                    "timeout_ms": 5000
+                }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("reason=matched"),
+        "wait_for_output must return reason=matched when 'hello' appears; got:\n{text}"
+    );
+    assert!(
+        text.contains("hello"),
+        "result must include the Snapshot containing 'hello'; got:\n{text}"
+    );
+    assert!(
+        text.contains("[cursor"),
+        "result must include cursor info; got:\n{text}"
+    );
+
+    ct.cancel();
+}
+
+/// wait_for_output returns reason=idle when output stops changing for idle_ms.
+///
+/// Spawns `cat` (no output until input). Waits with idle_ms=200 and a 5s timeout.
+/// Since `cat` produces no output, idle must fire well before the timeout.
+#[tokio::test]
+async fn wait_for_output_idle_fires() {
+    let (client, url, ct) = spawn_daemon(DEV_TOKEN).await;
+    let mcp_session_id = mcp_init(&client, &url).await;
+
+    mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "create_session",
+                "arguments": { "session_id": "wfo-idle", "program": "cat" }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    // Give cat a moment to start, then wait for idle.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let resp = mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "wait_for_output",
+                "arguments": {
+                    "session_id": "wfo-idle",
+                    "idle_ms": 300,
+                    "timeout_ms": 5000
+                }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("reason=idle"),
+        "wait_for_output must return reason=idle when output is quiet; got:\n{text}"
+    );
+
+    ct.cancel();
+}
+
+/// wait_for_output returns reason=timeout when neither pattern nor idle fires.
+///
+/// Spawns `cat` (no output) with a short timeout (300 ms) and NO idle_ms, so
+/// the only condition is the timeout itself.
+#[tokio::test]
+async fn wait_for_output_timeout_fires() {
+    let (client, url, ct) = spawn_daemon(DEV_TOKEN).await;
+    let mcp_session_id = mcp_init(&client, &url).await;
+
+    mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "create_session",
+                "arguments": { "session_id": "wfo-timeout", "program": "cat" }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    let resp = mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "wait_for_output",
+                "arguments": {
+                    "session_id": "wfo-timeout",
+                    "pattern": "this-will-never-appear",
+                    "timeout_ms": 300
+                }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("reason=timeout"),
+        "wait_for_output must return reason=timeout when deadline fires; got:\n{text}"
+    );
+
+    ct.cancel();
+}
+
+/// wait_for_output pattern match works with a valid regex.
+///
+/// Pattern `h.llo` should match "hello" via regex. Uses a shell session with
+/// send_keys to produce the output (same approach as wait_for_output_matches_pattern).
+#[tokio::test]
+async fn wait_for_output_regex_pattern() {
+    let (client, url, ct) = spawn_daemon(DEV_TOKEN).await;
+    let mcp_session_id = mcp_init(&client, &url).await;
+
+    mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "create_session",
+                "arguments": { "session_id": "wfo-regex" }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    // Give the shell a moment to start.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "send_keys",
+                "arguments": { "session_id": "wfo-regex", "keys": ["echo hello", "<ENTER>"] }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    let resp = mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {
+                "name": "wait_for_output",
+                "arguments": {
+                    "session_id": "wfo-regex",
+                    "pattern": "h.llo",
+                    "timeout_ms": 5000
+                }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("reason=matched"),
+        "regex pattern h.llo must match 'hello'; got:\n{text}"
+    );
+
+    ct.cancel();
+}
+
+/// Demo: waiting for a known prompt works (by spawning a shell, sending a
+/// command, and waiting for its output) and waiting for a command going quiet
+/// (idle) also works.
+///
+/// This directly validates the AC: "waiting for a known prompt and for
+/// a command-goes-quiet both work".
+#[tokio::test]
+async fn wait_for_output_demo_prompt_and_idle() {
+    let (client, url, ct) = spawn_daemon(DEV_TOKEN).await;
+    let mcp_session_id = mcp_init(&client, &url).await;
+
+    // Test 1: waiting for a known prompt string — spawn a shell, type a command
+    // that prints a sentinel, and wait for it to appear.
+    mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "create_session",
+                "arguments": { "session_id": "demo-prompt" }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    // Give the shell a moment to start.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "send_keys",
+                "arguments": { "session_id": "demo-prompt", "keys": ["echo prompt_ready", "<ENTER>"] }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    let resp1 = mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {
+                "name": "wait_for_output",
+                "arguments": {
+                    "session_id": "demo-prompt",
+                    "pattern": "prompt_ready",
+                    "timeout_ms": 5000
+                }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    let text1 = resp1["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        text1.contains("reason=matched"),
+        "demo: waiting for known prompt must return matched; got:\n{text1}"
+    );
+
+    // Test 2: command goes quiet → idle fires.
+    mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+            "params": {
+                "name": "create_session",
+                "arguments": { "session_id": "demo-quiet", "program": "cat" }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    // Give cat a moment to start, then wait for idle.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let resp2 = mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+            "params": {
+                "name": "wait_for_output",
+                "arguments": {
+                    "session_id": "demo-quiet",
+                    "idle_ms": 300,
+                    "timeout_ms": 5000
+                }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    let text2 = resp2["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        text2.contains("reason=idle"),
+        "demo: command-goes-quiet must return idle; got:\n{text2}"
+    );
+
+    ct.cancel();
+}

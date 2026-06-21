@@ -201,6 +201,16 @@ impl SessionRegistry {
         Self::get_entry(&map, id)?.session.read_output(since)
     }
 
+    /// Return the current byte length of the output buffer for the Session.
+    ///
+    /// Used by `wait_for_output` to detect idle (quiescence) without holding the
+    /// buffer lock between samples. The caller samples this repeatedly and treats
+    /// a stable value for `idle_ms` as "output went quiet".
+    pub fn output_len(&self, id: &str) -> anyhow::Result<u64> {
+        let map = self.lock()?;
+        Self::get_entry(&map, id)?.session.output_len()
+    }
+
     /// Return a summary of every Session in the registry.
     ///
     /// Each entry includes the session id, command name, PTY dimensions, and
