@@ -18,6 +18,12 @@
 //! - `close_session` — terminates a Session's Hosted Process and removes it from
 //!   the registry; only the Writer may close.
 //! - `resize` — resize the PTY and emulator to new `cols` × `rows` dimensions.
+//! - `wait_for_output` — blocks until the visible Snapshot matches a pattern
+//!   (substring or regex) OR the output stream is idle for `idle_ms`, OR
+//!   `timeout_ms` elapses. Returns the Snapshot and a `reason` field.
+//! - `execute_command` — convenience sugar: types a command + Enter via the
+//!   Write Lock, waits for the output to go idle, and returns the visible
+//!   Snapshot plus the raw bytes produced since the command was sent.
 //!
 //! ## Write Lock
 //!
@@ -160,6 +166,37 @@ pub struct WaitForOutputInput {
     /// even at the deadline, so a zero budget with a pattern already on screen
     /// returns `"matched"`, not `"timeout"`).
     pub timeout_ms: u64,
+}
+
+/// Input schema for the `execute_command` MCP tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExecuteCommandInput {
+    /// The id of the Session to run the command in.
+    ///
+    /// The calling client must be the Session's Writer — the Write Lock is
+    /// enforced before sending any keystrokes. Only the Writer may call this
+    /// tool; Observers receive an error.
+    pub session_id: String,
+
+    /// The command line to execute.
+    ///
+    /// Sent verbatim to the Hosted Process's stdin followed by `\r` (Enter).
+    /// Equivalent to typing `command<ENTER>` at the shell prompt. No shell
+    /// quoting or escaping is applied by TI — the caller is responsible for
+    /// proper shell syntax.
+    pub command: String,
+
+    /// Hard deadline in milliseconds for the command to produce output and go
+    /// idle.
+    ///
+    /// After `<ENTER>` is sent, the tool waits for the output stream to be
+    /// idle (quiescent) for `idle_settle_ms` (default 200 ms) before returning.
+    /// If `timeout_ms` elapses before that quiescence window is observed, the
+    /// tool returns what has been captured so far.
+    ///
+    /// Defaults to 30 000 ms (30 s) when omitted.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 /// The MCP Server handler embedded in the TI Daemon.
@@ -524,8 +561,6 @@ impl McpListener {
 
             // --- Pattern check on the visible Snapshot. ---
             if let Some(pat) = pattern.as_deref() {
-                // Cache the joined screen text so the same allocation is reused
-                // for both the match test and the result body on success.
                 let screen = snap.text();
                 let matched = match &compiled_re {
                     Some(re) => re.is_match(&screen),
@@ -533,10 +568,7 @@ impl McpListener {
                     None => screen.contains(pat),
                 };
                 if matched {
-                    let body = format!(
-                        "[wait_for_output reason=matched]\n{screen}\n[cursor col={} row={} visible={}]",
-                        snap.cursor_col, snap.cursor_row, snap.cursor_visible,
-                    );
+                    let body = format_wait_result("matched", &snap);
                     return Ok(CallToolResult::success(vec![Content::text(body)]));
                 }
             }
@@ -570,6 +602,114 @@ impl McpListener {
             let remaining = deadline.saturating_duration_since(Instant::now());
             tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
         }
+    }
+
+    /// Type a command + Enter into a Session and wait for output to settle.
+    ///
+    /// Convenience sugar over `send_keys` + `wait_for_output`. The full flow:
+    ///
+    /// 1. Records the current output byte offset as the command boundary.
+    /// 2. Sends `command\r` via the Write Lock (only the Writer may call this).
+    /// 3. Waits until the output stream is idle for 200 ms (quiescence), or
+    ///    `timeout_ms` elapses.
+    /// 4. Returns the visible Snapshot and the raw output bytes produced since
+    ///    the command was sent.
+    ///
+    /// Callers that need finer control (waiting for a specific pattern, or
+    /// inspecting output that scrolled off the visible screen) should use
+    /// `wait_for_output` + `read_output` directly.
+    #[tool(
+        description = "Type a command + Enter via the Write Lock, wait for output to settle, \
+                       and return the visible Snapshot plus the raw output since the command. \
+                       Only the Writer (session creator) may call this. \
+                       timeout_ms defaults to 30 000 ms."
+    )]
+    async fn execute_command(
+        &self,
+        Parameters(ExecuteCommandInput {
+            session_id,
+            command,
+            timeout_ms,
+        }): Parameters<ExecuteCommandInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+        // After the command is sent, wait for output to be idle for this long.
+        const IDLE_SETTLE_MS: u64 = 200;
+        const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+        let timeout_ms = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
+
+        // Record the output offset before the command so we can return only
+        // the output produced BY this command (not prior session output).
+        let start_offset = self
+            .registry
+            .output_len(&session_id)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        // Send the command followed by \r (Enter). Enforces Write Lock — only
+        // the Writer of this Session may call send_keys / write_input.
+        let bytes = encode_keys(&[command.clone(), "<ENTER>".to_string()]);
+        self.registry
+            .write_input(&session_id, &self.client_id, &bytes)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        // Wait for idle (quiescence) using the same polling logic as
+        // `wait_for_output`. Idle is defined as no new bytes in the output
+        // buffer for IDLE_SETTLE_MS ms.
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        // Initialise last_len from start_offset — no second registry call needed.
+        let mut last_len = start_offset;
+        let mut idle_since = Instant::now();
+
+        loop {
+            let current_len = self
+                .registry
+                .output_len(&session_id)
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+            if current_len != last_len {
+                last_len = current_len;
+                idle_since = Instant::now();
+            }
+
+            // Check idle condition before timeout so a command that completes
+            // right at the deadline is still reported as settled, not timed out.
+            if idle_since.elapsed() >= Duration::from_millis(IDLE_SETTLE_MS) {
+                break; // output settled
+            }
+
+            if Instant::now() >= deadline {
+                break; // deadline reached — return what we have
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
+        }
+
+        // Capture the visible Snapshot and the raw output bytes produced since
+        // the command boundary.
+        let snap = self
+            .registry
+            .take_snapshot(&session_id)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let raw_chunk = self
+            .registry
+            .read_output(&session_id, start_offset)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let raw_text = String::from_utf8_lossy(&raw_chunk.data);
+        let body = format!(
+            "[execute_command command={command:?}]\n\
+             [snapshot]\n{}\n[cursor col={} row={} visible={}]\n\
+             [raw_output bytes={}]\n{raw_text}",
+            snap.text(),
+            snap.cursor_col,
+            snap.cursor_row,
+            snap.cursor_visible,
+            raw_chunk.data.len(),
+        );
+        Ok(CallToolResult::success(vec![Content::text(body)]))
     }
 
     /// Terminate a Session's Hosted Process and remove it from the registry.
@@ -609,6 +749,8 @@ impl ServerHandler for McpListener {
                  (including content scrolled off the visible screen), \
                  wait_for_output to block until a pattern appears on screen OR output goes idle \
                  (pass timeout_ms as the required deadline), \
+                 execute_command to type a command + Enter and wait for it to settle \
+                 (returns visible Snapshot + raw output; only the Writer may call this), \
                  resize to change the PTY dimensions, \
                  list_sessions to enumerate active Sessions, \
                  and close_session to terminate and remove a Session.",

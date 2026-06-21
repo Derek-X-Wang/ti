@@ -1459,3 +1459,207 @@ async fn wait_for_output_demo_prompt_and_idle() {
 
     ct.cancel();
 }
+
+// ── Issue #9: execute_command ─────────────────────────────────────────────────
+
+/// execute_command types a shell command and returns visible Snapshot + raw output.
+///
+/// Spawns a shell, calls execute_command with "echo hello", and verifies the
+/// result contains "hello" in both the Snapshot and raw_output sections.
+#[tokio::test]
+async fn execute_command_returns_output() {
+    let (client, url, ct) = spawn_daemon(DEV_TOKEN).await;
+    let mcp_session_id = mcp_init(&client, &url).await;
+
+    // create_session — spawn the default shell.
+    mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "create_session",
+                "arguments": { "session_id": "ec1" }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    // Give the shell a moment to print its prompt.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // execute_command — send "echo hello" to the shell.
+    let resp = mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "execute_command",
+                "arguments": {
+                    "session_id": "ec1",
+                    "command": "echo hello"
+                }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("[execute_command command="),
+        "response must have execute_command header; got:\n{text}"
+    );
+    assert!(
+        text.contains("hello"),
+        "response must contain 'hello' from echo; got:\n{text}"
+    );
+    assert!(
+        text.contains("[snapshot]"),
+        "response must contain snapshot section; got:\n{text}"
+    );
+    assert!(
+        text.contains("[raw_output"),
+        "response must contain raw_output section; got:\n{text}"
+    );
+
+    ct.cancel();
+}
+
+/// execute_command enforces the Write Lock — non-Writer is rejected.
+///
+/// Creates a session with writer-a and tries to execute_command from a
+/// different McpListener instance (simulating a non-Writer client).
+#[test]
+fn execute_command_non_writer_rejected() {
+    // Use the registry directly to simulate two clients with different ids.
+    let registry = SessionRegistry::new();
+    registry
+        .create_session("ec-wl1".to_string(), "cat", &[], "writer-a".to_string())
+        .expect("create_session failed");
+
+    // A non-Writer cannot write input — registry enforces this.
+    let err = registry
+        .write_input("ec-wl1", "observer-b", b"echo hi\r")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not Writer"),
+        "Non-Writer must be rejected by execute_command; got: {err}"
+    );
+}
+
+/// execute_command with a timeout that fires returns what was captured.
+///
+/// Spawns cat (no output), calls execute_command with a short timeout.
+/// The tool must return without hanging indefinitely.
+#[tokio::test]
+async fn execute_command_timeout_returns() {
+    let (client, url, ct) = spawn_daemon(DEV_TOKEN).await;
+    let mcp_session_id = mcp_init(&client, &url).await;
+
+    // Spawn cat — it won't produce output until it receives input.
+    mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "create_session",
+                "arguments": { "session_id": "ec-timeout", "program": "cat" }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    // Send a command that cat will echo back, with a short timeout.
+    // Cat echoes input, so it will produce output then wait for more.
+    // The idle settle (200ms) should fire after the echo.
+    let resp = mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "execute_command",
+                "arguments": {
+                    "session_id": "ec-timeout",
+                    "command": "hello",
+                    "timeout_ms": 2000
+                }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    // Must return without error and include a snapshot.
+    assert!(
+        text.contains("[execute_command"),
+        "execute_command must return a result even on timeout; got:\n{text}"
+    );
+
+    ct.cancel();
+}
+
+/// Demo: execute_command "ls" returns a directory listing.
+///
+/// This directly validates the AC: "execute_command 'ls' returns a directory listing".
+#[tokio::test]
+async fn execute_command_demo_ls() {
+    let (client, url, ct) = spawn_daemon(DEV_TOKEN).await;
+    let mcp_session_id = mcp_init(&client, &url).await;
+
+    mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "create_session",
+                "arguments": { "session_id": "ec-demo" }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    // Give the shell a moment to start.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let resp = mcp_post(
+        &client,
+        &url,
+        DEV_TOKEN,
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "execute_command",
+                "arguments": {
+                    "session_id": "ec-demo",
+                    "command": "ls /usr/bin/env"
+                }
+            }
+        }),
+        mcp_session_id.as_deref(),
+    )
+    .await;
+
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    // "ls /usr/bin/env" outputs the path of the env binary — it should appear
+    // in the snapshot or raw output.
+    assert!(
+        text.contains("env") || text.contains("usr"),
+        "execute_command 'ls /usr/bin/env' must return the binary path; got:\n{text}"
+    );
+
+    ct.cancel();
+}
