@@ -13,7 +13,7 @@
 pub mod session;
 pub mod snapshot;
 
-pub use session::{OutputChunk, Session};
+pub use session::{ObserverHandle, OutputChunk, ScreenUpdate, Session};
 pub use snapshot::{Attrs, Color, Snapshot, StyledCell, StyledSnapshot};
 // Re-export so ti-daemon doesn't need a direct portable_pty dependency for ExitStatus.
 pub use portable_pty::ExitStatus;
