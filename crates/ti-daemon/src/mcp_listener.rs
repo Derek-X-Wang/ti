@@ -30,7 +30,9 @@
 //! transports (stdio adapter, gRPC) can be layered later per ADR-0001.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
+use regex::Regex;
 use rmcp::{
     handler::server::router::tool::ToolRouter,
     handler::server::wrapper::Parameters,
@@ -123,6 +125,41 @@ pub struct SendKeysInput {
 pub struct CloseSessionInput {
     /// The id of the Session to close. Only the Writer may close a Session.
     pub session_id: String,
+}
+
+/// Input schema for the `wait_for_output` MCP tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WaitForOutputInput {
+    /// The id of the Session to wait on.
+    pub session_id: String,
+
+    /// Pattern to match against the visible Snapshot text.
+    ///
+    /// The string is first compiled as a `Regex`. If it is not valid regex
+    /// syntax, it is treated as a literal substring search. Since most strings
+    /// are valid regex, callers should use `regex::escape` for literal prompts
+    /// that contain regex metacharacters (e.g. `$`, `(`, `.`). When omitted,
+    /// pattern matching is disabled — only `idle_ms` and `timeout_ms` apply.
+    #[serde(default)]
+    pub pattern: Option<String>,
+
+    /// Quiescence window in milliseconds.
+    ///
+    /// Returns with `reason: "idle"` when the output byte count has not changed
+    /// for at least this many milliseconds. Measures quiescence of the output
+    /// event stream, not the visible screen. When omitted, idle detection is
+    /// disabled — only `pattern` and `timeout_ms` apply.
+    #[serde(default)]
+    pub idle_ms: Option<u64>,
+
+    /// Hard deadline in milliseconds (required).
+    ///
+    /// The call returns with `reason: "timeout"` if neither `pattern` nor
+    /// `idle_ms` fires before this deadline. A value of `0` returns immediately
+    /// after one condition-check iteration (conditions take priority over timeout
+    /// even at the deadline, so a zero budget with a pattern already on screen
+    /// returns `"matched"`, not `"timeout"`).
+    pub timeout_ms: u64,
 }
 
 /// The MCP Server handler embedded in the TI Daemon.
@@ -228,6 +265,21 @@ fn encode_keys(keys: &[String]) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Format the `wait_for_output` result text.
+///
+/// Returns a compact summary line followed by the Snapshot text — the same
+/// format as `take_snapshot` (plain text + cursor info) so callers can parse
+/// the Snapshot without special-casing this tool's output.
+fn format_wait_result(reason: &str, snap: &ti_core::Snapshot) -> String {
+    format!(
+        "[wait_for_output reason={reason}]\n{}\n[cursor col={} row={} visible={}]",
+        snap.text(),
+        snap.cursor_col,
+        snap.cursor_row,
+        snap.cursor_visible,
+    )
 }
 
 #[tool_router]
@@ -415,6 +467,111 @@ impl McpListener {
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
 
+    /// Block until the visible Snapshot matches a pattern, output goes idle,
+    /// or the timeout fires.
+    ///
+    /// Polls the Session every 50 ms. Returns the first condition that triggers:
+    ///
+    /// - **matched** — the visible Snapshot text contains `pattern`. The pattern
+    ///   is compiled as a `Regex`; on compile failure it falls back to literal
+    ///   substring search. Callers should escape regex metacharacters (`$`, `(`,
+    ///   `.` etc.) when matching literal prompt strings.
+    /// - **idle** — the output byte count has not grown for at least `idle_ms`
+    ///   milliseconds (quiescence of the PTY output stream).
+    /// - **timeout** — `timeout_ms` elapsed with neither condition firing.
+    ///
+    /// Always returns the Snapshot at the moment the condition was detected.
+    #[tool(
+        description = "Block until the visible Snapshot matches pattern (substring/regex), \
+                       OR output is idle for idle_ms, OR timeout_ms elapses. \
+                       Returns the Snapshot and reason: matched | idle | timeout. \
+                       timeout_ms is required."
+    )]
+    async fn wait_for_output(
+        &self,
+        Parameters(WaitForOutputInput {
+            session_id,
+            pattern,
+            idle_ms,
+            timeout_ms,
+        }): Parameters<WaitForOutputInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // Compile the regex once outside the poll loop. Failures fall back to
+        // substring search so callers don't need to escape simple strings.
+        let compiled_re: Option<Regex> = pattern.as_deref().and_then(|p| Regex::new(p).ok());
+
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+        // Idle tracking: record the output length and the time it was last seen
+        // to grow. We start the idle clock from NOW so a session that is already
+        // quiet at call time can trigger the idle condition.
+        let mut last_len = self
+            .registry
+            .output_len(&session_id)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let mut idle_since = Instant::now();
+
+        const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+        loop {
+            // Take one Snapshot per iteration — used for pattern check, idle
+            // exit, and the timeout exit path. A single call avoids a redundant
+            // registry lock acquisition on the timeout branch.
+            let snap = self
+                .registry
+                .take_snapshot(&session_id)
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+            // --- Pattern check on the visible Snapshot. ---
+            if let Some(pat) = pattern.as_deref() {
+                // Cache the joined screen text so the same allocation is reused
+                // for both the match test and the result body on success.
+                let screen = snap.text();
+                let matched = match &compiled_re {
+                    Some(re) => re.is_match(&screen),
+                    // Pattern failed to compile as regex — fall back to substring.
+                    None => screen.contains(pat),
+                };
+                if matched {
+                    let body = format!(
+                        "[wait_for_output reason=matched]\n{screen}\n[cursor col={} row={} visible={}]",
+                        snap.cursor_col, snap.cursor_row, snap.cursor_visible,
+                    );
+                    return Ok(CallToolResult::success(vec![Content::text(body)]));
+                }
+            }
+
+            // --- Idle check: sample output length and track quiescence. ---
+            if let Some(idle_threshold) = idle_ms {
+                let current_len = self
+                    .registry
+                    .output_len(&session_id)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+                if current_len != last_len {
+                    // Output grew — reset the idle clock.
+                    last_len = current_len;
+                    idle_since = Instant::now();
+                } else if idle_since.elapsed() >= Duration::from_millis(idle_threshold) {
+                    let body = format_wait_result("idle", &snap);
+                    return Ok(CallToolResult::success(vec![Content::text(body)]));
+                }
+            }
+
+            // --- Timeout check — placed AFTER condition checks so that pattern
+            // or idle wins when they fire on the same iteration as the deadline.
+            // A deadline of 0 ms returns on the very first iteration.
+            if Instant::now() >= deadline {
+                let body = format_wait_result("timeout", &snap);
+                return Ok(CallToolResult::success(vec![Content::text(body)]));
+            }
+
+            // Sleep until the next poll, but wake early if the deadline arrives.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
+        }
+    }
+
     /// Terminate a Session's Hosted Process and remove it from the registry.
     ///
     /// Sends a kill signal to the Hosted Process (if still running) then removes
@@ -450,6 +607,8 @@ impl ServerHandler for McpListener {
                  take_snapshot to read the visible screen (pass include_styles=true for color data), \
                  read_output to page through the full output history \
                  (including content scrolled off the visible screen), \
+                 wait_for_output to block until a pattern appears on screen OR output goes idle \
+                 (pass timeout_ms as the required deadline), \
                  resize to change the PTY dimensions, \
                  list_sessions to enumerate active Sessions, \
                  and close_session to terminate and remove a Session.",

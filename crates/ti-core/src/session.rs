@@ -433,6 +433,21 @@ impl Session {
         })
     }
 
+    /// Return the current byte length of the output buffer.
+    ///
+    /// Used by callers that poll for output quiescence: if the length does not
+    /// change for `idle_ms` milliseconds, the stream is considered idle.
+    ///
+    /// Acquires the buffer lock briefly and releases it immediately — safe to
+    /// call from any thread, including while the reader thread is writing.
+    pub fn output_len(&self) -> anyhow::Result<u64> {
+        let buf = self
+            .output_buf
+            .lock()
+            .map_err(|_| anyhow::anyhow!("output buffer lock poisoned"))?;
+        Ok(buf.len() as u64)
+    }
+
     /// Non-blocking exit status check.
     ///
     /// Returns `Some(status)` if the Hosted Process has exited, `None` if it is
